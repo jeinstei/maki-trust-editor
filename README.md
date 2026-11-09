@@ -1,5 +1,8 @@
 # maki trust editor
 
+NOTE as of 9.11.2026: This app was created with directed AI coding and actual user testing. The code has
+not yet been reviewed by a human overall.
+
 A small QtPy desktop app to **review and edit the permissions maki keeps** —
 session rules, per-project rules, global rules, folder trust, and the frozen
 pre-trust snapshot — in one clear window, with checkbox lists instead of
