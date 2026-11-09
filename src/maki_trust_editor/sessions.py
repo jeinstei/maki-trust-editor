@@ -104,6 +104,16 @@ class ToolGroup:
         return rules
 
 
+def canonical_rules(rules: list[SessionRule]) -> list[SessionRule]:
+    """Rules in the canonical order a save writes (tools sorted, scopes first).
+
+    A freshly loaded session keeps the file's raw order, which may differ from
+    this, so it must be canonicalized before it is compared with the baseline or
+    an untouched session would look edited.
+    """
+    return [rule for group in ToolGroup.group(rules) for rule in group.to_rules()]
+
+
 @dataclass
 class Session:
     path: Path

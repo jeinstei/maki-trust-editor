@@ -146,6 +146,7 @@ class ScopeRulesEditor(QWidget):
         # stays visible and choosing a real effect replaces it instead of losing
         # it. Only consulted while the box sits on the invalid sentinel.
         self._invalid_default: str | None = None
+        self._loading = False
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -154,10 +155,10 @@ class ScopeRulesEditor(QWidget):
         header = QHBoxLayout()
         self.default_box = QComboBox()
         self.default_box.addItems(DEFAULT_LABELS)
-        self.default_box.currentIndexChanged.connect(lambda _: self._on_change())
+        self.default_box.currentIndexChanged.connect(lambda _: self._notify())
         self.all_box = QComboBox()
         self.all_box.addItems(ALL_SCOPES_LABELS)
-        self.all_box.currentIndexChanged.connect(lambda _: self._on_change())
+        self.all_box.currentIndexChanged.connect(lambda _: self._notify())
 
         header.addWidget(QLabel("Section default:"))
         header.addWidget(self.default_box)
@@ -194,23 +195,32 @@ class ScopeRulesEditor(QWidget):
         reject (e.g. ``""``) lands on the ``(invalid)`` sentinel so the row stays
         visible and its raw text survives an untouched save.
         """
-        self._invalid_default = None
-        if default is None:
-            index = 0
-        else:
-            index = self.default_box.findText(default)
-            if index < 0:
-                self._invalid_default = default
-                index = self.default_box.findText(INVALID_LABEL)
-        self.default_box.setCurrentIndex(index)
-        all_index = (SCOPE_EFFECTS.index(all_effect) + 1) if all_effect in SCOPE_EFFECTS else 0
-        self.all_box.setCurrentIndex(all_index)
+        self._loading = True
+        try:
+            self._invalid_default = None
+            if default is None:
+                index = 0
+            else:
+                index = self.default_box.findText(default)
+                if index < 0:
+                    self._invalid_default = default
+                    index = self.default_box.findText(INVALID_LABEL)
+            self.default_box.setCurrentIndex(index)
+            all_index = (SCOPE_EFFECTS.index(all_effect) + 1) if all_effect in SCOPE_EFFECTS else 0
+            self.all_box.setCurrentIndex(all_index)
+        finally:
+            self._loading = False
+
+    def _notify(self) -> None:
+        """Tell the owner the rules changed, unless we are loading them."""
+        if not self._loading:
+            self._on_change()
 
     def add_row(self, scope: str, effect: str) -> None:
-        row = ScopeRow(scope, effect, self._on_change, self._remove_row)
+        row = ScopeRow(scope, effect, self._notify, self._remove_row)
         self._rows.append(row)
         self._rows_box.addWidget(row)
-        self._on_change()
+        self._notify()
 
     def set_read_only(self, read_only: bool) -> None:
         """Disable every control, leaving the rules visible but uneditable."""
@@ -225,7 +235,7 @@ class ScopeRulesEditor(QWidget):
         self._rows.remove(row)
         row.setParent(None)
         row.deleteLater()
-        self._on_change()
+        self._notify()
 
     def clear(self) -> None:
         for row in list(self._rows):

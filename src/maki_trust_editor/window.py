@@ -53,6 +53,8 @@ DIRTY_MARK = " *"
 # Tab labels in addTab order, so titles can be rebuilt with the dirty marker
 # without repeating the strings.
 TAB_TITLES = ("Sessions", "Projects", "Folders", "Global")
+SESSIONS_TAB = TAB_TITLES.index("Sessions")
+PROJECTS_TAB = TAB_TITLES.index("Projects")
 GLOBAL_TAB = TAB_TITLES.index("Global")
 
 # Marks a session another maki holds open. The padlock is the clear glyph; the
@@ -213,16 +215,18 @@ class PermissionsTab(QWidget):
 
 
 class SessionsTab(QWidget):
-    def __init__(self, on_rules_changed, confirm_switch=None) -> None:
+    def __init__(self, on_rules_changed, commit, is_dirty) -> None:
         super().__init__()
         self._views: list[workspace.SessionView] = []
         self._current: workspace.Session | None = None
-        self._confirm_switch = confirm_switch or (lambda: True)
+        self._commit = commit
+        self._is_dirty = is_dirty
 
         layout = QHBoxLayout(self)
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
         self._shown = -1
+        self.loading = False
 
         left = QWidget()
         left_layout = QVBoxLayout(left)
@@ -258,25 +262,30 @@ class SessionsTab(QWidget):
 
     def load(self, views: list[workspace.SessionView]) -> None:
         self._views = views
+        self._labels = []
         self.list.blockSignals(True)
         self.list.clear()
         for view in views:
-            item = QListWidgetItem(f"{_lock_prefix(view.locked)}{view.label}\n{view.subtitle}")
+            self._labels.append(f"{_lock_prefix(view.locked)}{view.label}\n{view.subtitle}")
+            item = QListWidgetItem(self._labels[-1])
             item.setToolTip(("open in maki\n" if view.locked else "") + view.subtitle)
             self.list.addItem(item)
         self.list.blockSignals(False)
         self._selected(self.list.currentRow())
 
+    def row_label(self, row: int) -> str:
+        return self._labels[row]
+
     def _selected(self, row: int) -> None:
-        if self._shown >= 0 and row != self._shown and not self._confirm_switch():
-            self.list.blockSignals(True)
-            self.list.setCurrentRow(self._shown)
-            self.list.blockSignals(False)
-            return
+        if row != self._shown:
+            # Park the outgoing session's edits in its model so they survive the
+            # switch (dirty persists across clicks) instead of being dropped.
+            self._commit()
         self._populate_row(row)
 
     def _populate_row(self, row: int) -> None:
         self._shown = row
+        self.loading = True
         self.scoped.clear_editors()
         self._editors.clear()
         if row < 0 or row >= len(self._views):
@@ -284,12 +293,15 @@ class SessionsTab(QWidget):
             self._add_button.setEnabled(False)
             self.file_label.setText("file: (none)")
             self.header.setText("Select a session")
+            self.loading = False
             return
         view = self._views[row]
         # Re-read before showing: a live session grows while maki runs, so the
         # copy loaded at startup has a stale last-line offset. Loading fresh
-        # keeps the rules (and the offset a save writes from) current.
-        view.reload()
+        # keeps the rules (and the offset a save writes from) current. A row
+        # with a pending edit is left alone: reloading would drop it.
+        if not self._is_dirty(row):
+            view.reload()
         session = view.session
         self._current = session
         self.file_label.setText(f"file: {session.path}")
@@ -310,6 +322,17 @@ class SessionsTab(QWidget):
         self.scoped.set_read_only(read_only)
         self._add_button.setEnabled(not read_only)
         self.scoped.refresh()
+        self.loading = False
+
+    def commit(self) -> None:
+        """Park the shown session's editor content in its model.
+
+        Called before switching away, so an edit survives the click and still
+        counts as dirty later. The model keeps the rules; the file is untouched
+        until Save.
+        """
+        if self._current is not None:
+            self._current.rules = self.collect()
 
     def _add_group(self) -> None:
         if self._current is None:
@@ -558,6 +581,8 @@ class MainWindow(QMainWindow):
         self.resize(1100, 760)
 
         self._last_project_row = -1
+        self._active_tab = SESSIONS_TAB
+        self._loading = False
         self._baseline: dict = {}
         self._maki_cache = None
         self._maki_checked_at = 0.0
@@ -574,7 +599,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.status)
 
         self.tabs = QTabWidget()
-        self.sessions_tab = SessionsTab(self._mark_dirty, self._confirm_session_switch)
+        self.sessions_tab = SessionsTab(self._mark_dirty, self._mark_dirty, self._session_row_dirty)
         self.global_tab = PermissionsTab("No global permissions file yet.", self._mark_dirty)
         self.projects_tab = PermissionsTab("Select a project.", self._mark_dirty)
         self.folders_tab = FoldersTab(self._mark_dirty)
@@ -625,8 +650,10 @@ class MainWindow(QMainWindow):
         try:
             self.sessions_tab.load(self.workspace.sessions)
             self.projects_selector.clear()
+            self._project_labels = []
             for view in self.workspace.projects:
-                item = QListWidgetItem(f"{view.label}\n{view.subtitle}")
+                self._project_labels.append(f"{view.label}\n{view.subtitle}")
+                item = QListWidgetItem(self._project_labels[-1])
                 item.setToolTip(view.subtitle)
                 self.projects_selector.addItem(item)
             self.folders_tab.load(self.workspace.trust_document, self.workspace.pre_trust_roots)
@@ -637,7 +664,7 @@ class MainWindow(QMainWindow):
             self._capture_baselines()
             if self.workspace.projects:
                 self.projects_selector.setCurrentRow(0)
-            self._refresh_tab_titles()
+            self._refresh_marks()
             self._update_status("Loaded. Edit, then Save. Backups are kept automatically.")
         finally:
             app.restoreOverrideCursor()
@@ -686,11 +713,7 @@ class MainWindow(QMainWindow):
             session = view.session
             if not session.has_rules_line:
                 continue
-            session.rules = [
-                rule
-                for group in sessions.ToolGroup.group(session.rules)
-                for rule in group.to_rules()
-            ]
+            session.rules = sessions.canonical_rules(session.rules)
             self._baseline[session.path] = session.rules_line()
         for view in self.workspace.projects:
             file = view.permissions_file
@@ -720,7 +743,16 @@ class MainWindow(QMainWindow):
         return self._maki_cache
 
     def _mark_dirty(self) -> None:
-        self._refresh_tab_titles()
+        """Push the edited widgets into their model, then refresh marks.
+
+        Committing on every edit keeps the model equal to what is on screen, so
+        a dirty check is a pure comparison and a switch-away needs no special
+        handling: the edit is already parked where Save will find it.
+        """
+        if self._loading or self.sessions_tab.loading:
+            return
+        self._commit_current()
+        self._refresh_marks()
         self._update_status("Unsaved changes.")
 
     def _dirty(self) -> bool:
@@ -731,17 +763,22 @@ class MainWindow(QMainWindow):
         """
         return bool(self._collect_targets())
 
-    def _confirm_session_switch(self) -> bool:
-        if not self._dirty():
-            return True
-        answer = QMessageBox.question(
-            self,
-            "Unsaved changes",
-            "Discard unsaved session edits and switch sessions?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        return answer == QMessageBox.StandardButton.Yes
+    def _commit_tab(self, index: int) -> None:
+        """Park the visible editor's content in its model for the given tab.
+
+        Session and project editors can switch their backing file while showing
+        content, so their edits are committed here. Global and folders are single
+        files read straight through on save, so they need nothing.
+        """
+        if index == SESSIONS_TAB:
+            self.sessions_tab.commit()
+        elif index == PROJECTS_TAB and self.projects_selector.currentRow() >= 0:
+            file = self.projects_tab.collect()
+            if file is not None:
+                self.workspace.projects[self.projects_selector.currentRow()].permissions_file = file
+
+    def _commit_current(self) -> None:
+        self._commit_tab(self.tabs.currentIndex())
 
     def closeEvent(self, event) -> None:
         if self._force_close or not self._dirty():
@@ -771,12 +808,16 @@ class MainWindow(QMainWindow):
         stale copy would show (and save over) old rules. Skipped while anything
         is dirty so an unsaved edit is never discarded.
         """
-        self._refresh_tab_titles()
+        self._commit_tab(self._active_tab)
+        self._active_tab = index
+        self._refresh_marks()
         if index != GLOBAL_TAB or self.workspace.global_permissions is None:
             return
-        if self._dirty():
-            return
         path = self.workspace.global_permissions.path
+        if path in self._baseline and (
+            self.workspace.global_permissions.to_toml() != self._baseline[path]
+        ):
+            return
         try:
             self.workspace.global_permissions = permissions.PermissionsFile.load(path)
         except (OSError, ValueError):
@@ -785,22 +826,14 @@ class MainWindow(QMainWindow):
         self._capture_baselines()
 
     def _project_selected(self, row: int) -> None:
+        if row != self._last_project_row and self._last_project_row >= 0:
+            self._commit_tab(PROJECTS_TAB)
+            self._refresh_marks()
         if row < 0 or row >= len(self.workspace.projects):
             self.projects_tab.load(None)
             self.add_tool_btn.setEnabled(False)
             self.add_mcp_btn.setEnabled(False)
             return
-        if self._dirty():
-            answer = QMessageBox.question(
-                self,
-                "Unsaved changes",
-                "Discard unsaved changes and switch projects?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if answer == QMessageBox.StandardButton.No:
-                self.projects_selector.setCurrentRow(self._last_project_row)
-                return
         view = self.workspace.projects[row]
         view.reload()
         self.projects_tab.load(view.permissions_file)
@@ -824,16 +857,50 @@ class MainWindow(QMainWindow):
         if error:
             QMessageBox.warning(self, "Cannot add section", error)
 
-    def _changed_stores(self) -> list[tuple[int, safe_write.WriteTarget]]:
-        """Every store whose serialized content differs from the baseline.
+    def _session_row_dirty(self, row: int) -> bool:
+        return row in self._session_targets()
 
-        Each entry pairs the tab index that owns the store with the write
-        target, so Save can write them and the tab titles can mark them.
-        Comparing against the loaded baseline keeps a Save from rewriting (and
-        re-backing-up) files the user never touched, and from creating an empty
-        ``permissions.toml`` in a project that had none. A store with no
-        baseline (a missing or empty file) is never dirty: there is nothing to
-        compare against, so it is skipped rather than reported as changed.
+    def _session_targets(self) -> dict[int, tuple[int, safe_write.WriteTarget]]:
+        """Dirty sessions keyed by list row, for saving and row markers."""
+        dirty: dict[int, tuple[int, safe_write.WriteTarget]] = {}
+        for row, view in enumerate(self.workspace.sessions):
+            session = view.session
+            if not session.has_rules_line:
+                continue
+            if session.path not in self._baseline:
+                continue
+            if session.rules_line() != self._baseline[session.path]:
+                dirty[row] = (
+                    SESSIONS_TAB,
+                    safe_write.WriteTarget(path=session.path, shared=False, writer=session.write),
+                )
+        return dirty
+
+    def _project_targets(self) -> dict[int, tuple[int, safe_write.WriteTarget]]:
+        """Dirty project files keyed by selector row."""
+        dirty: dict[int, tuple[int, safe_write.WriteTarget]] = {}
+        for row, view in enumerate(self.workspace.projects):
+            file = view.permissions_file
+            if file.path not in self._baseline:
+                continue
+            if file.to_toml() != self._baseline[file.path]:
+                dirty[row] = (
+                    PROJECTS_TAB,
+                    safe_write.WriteTarget(path=file.path, shared=True),
+                )
+        return dirty
+
+    def _changed_stores(self) -> list[tuple[int, safe_write.WriteTarget]]:
+        """Every store whose model differs from the baseline.
+
+        Each entry pairs the tab index that owns the store with its write
+        target, so Save can write them and the tab titles can mark them. Edits
+        live in the model (committed on switch), so the visible editor is parked
+        first and then every model is compared. Comparing against the loaded
+        baseline keeps a Save from rewriting (and re-backing-up) files the user
+        never touched, and from creating an empty ``permissions.toml`` in a
+        project that had none. A store with no baseline (a missing or empty
+        file) is never dirty: there is nothing to compare against.
         """
         changed: list[tuple[int, safe_write.WriteTarget]] = []
 
@@ -843,32 +910,12 @@ class MainWindow(QMainWindow):
                     (tab, safe_write.WriteTarget(path=path, content=content, shared=shared))
                 )
 
-        row = self.sessions_tab.list.currentRow()
-        if row >= 0 and row == self.sessions_tab._shown:
-            session = self.workspace.sessions[row].session
-            if session.has_rules_line:
-                session.rules = self.sessions_tab.collect()
-                if (
-                    session.path in self._baseline
-                    and session.rules_line() != self._baseline[session.path]
-                ):
-                    changed.append(
-                        (
-                            0,
-                            safe_write.WriteTarget(
-                                path=session.path, shared=False, writer=session.write
-                            ),
-                        )
-                    )
-
-        if self.projects_selector.currentRow() >= 0:
-            project_file = self.projects_tab.collect()
-            if project_file is not None:
-                record(1, project_file.path, project_file.to_toml())
+        changed.extend(self._session_targets().values())
+        changed.extend(self._project_targets().values())
 
         global_file = self.global_tab.collect()
         if global_file is not None:
-            record(3, global_file.path, global_file.to_toml())
+            record(GLOBAL_TAB, global_file.path, global_file.to_toml())
 
         doc = self.workspace.trust_document
         if doc is not None:
@@ -883,8 +930,72 @@ class MainWindow(QMainWindow):
     def _collect_targets(self) -> list[safe_write.WriteTarget]:
         return [target for _, target in self._changed_stores()]
 
-    def _refresh_tab_titles(self) -> None:
-        """Mark each tab whose store has unsaved changes with a trailing ``*``."""
+    def _current_targets(self) -> list[safe_write.WriteTarget]:
+        """Write targets for the active tab's current selection only.
+
+        Save is per file: editing several sessions leaves them all dirty (each
+        marked in its list), but a Save writes just the one in view. Folders
+        holds two files that belong together, so both are written as a unit.
+        """
+        index = self.tabs.currentIndex()
+        self._commit_current()
+        if index == SESSIONS_TAB:
+            row = self.sessions_tab.list.currentRow()
+            entry = self._session_targets().get(row)
+            return [entry[1]] if entry else []
+        if index == PROJECTS_TAB:
+            row = self.projects_selector.currentRow()
+            entry = self._project_targets().get(row)
+            return [entry[1]] if entry else []
+        if index == GLOBAL_TAB:
+            if self.workspace.global_permissions is None:
+                return []
+            file = self.workspace.global_permissions
+            if file.path in self._baseline and file.to_toml() != self._baseline[file.path]:
+                return [safe_write.WriteTarget(path=file.path, content=file.to_toml())]
+            return []
+        return [target for tab, target in self._changed_stores() if tab == self.tabs.currentIndex()]
+
+    def _serialized(self, path) -> str | None:
+        """The model's current serialized form for ``path``, if it owns it.
+
+        Used to advance a file's baseline right after saving it, without
+        touching other stores' baselines.
+        """
+        for view in self.workspace.sessions:
+            if view.session.path == path and view.session.has_rules_line:
+                return view.session.rules_line()
+        for view in self.workspace.projects:
+            if view.permissions_file.path == path:
+                return view.permissions_file.to_toml()
+        if self.workspace.global_permissions is not None:
+            if self.workspace.global_permissions.path == path:
+                return self.workspace.global_permissions.to_toml()
+        if self.workspace.trust_document is not None:
+            if self.workspace.trust_document.path == path:
+                return self.workspace.trust_document.to_json()
+        if self.workspace.pre_trust_roots is not None:
+            if self.workspace.pre_trust_roots.path == path:
+                return self.workspace.pre_trust_roots.to_json()
+        return None
+
+    def _refresh_marks(self) -> None:
+        """Mark tabs, sessions and projects that hold unsaved changes.
+
+        A file stays dirty until its own Save, so the tab title gets ``*`` and
+        the list row gets the same mark, letting the user see which of several
+        edited sessions still needs writing.
+        """
+        dirty_sessions = self._session_targets()
+        dirty_projects = self._project_targets()
+        for row in range(self.sessions_tab.list.count()):
+            item = self.sessions_tab.list.item(row)
+            base = self.sessions_tab.row_label(row)
+            item.setText(base + (DIRTY_MARK if row in dirty_sessions else ""))
+        for row in range(self.projects_selector.count()):
+            item = self.projects_selector.item(row)
+            mark = DIRTY_MARK if row in dirty_projects else ""
+            item.setText(self._project_labels[row] + mark)
         dirty_tabs = {index for index, _ in self._changed_stores()}
         for index, title in enumerate(TAB_TITLES):
             self.tabs.setTabText(index, title + (DIRTY_MARK if index in dirty_tabs else ""))
@@ -918,16 +1029,16 @@ class MainWindow(QMainWindow):
         return [t for t in targets if t.path not in locked_paths]
 
     def _save(self) -> None:
-        targets = self._collect_targets()
+        targets = self._current_targets()
         if not targets:
-            self._update_status("Nothing to save.")
+            self._update_status("Nothing to save in this view.")
             return
 
         LOGGER.info("save: %d target(s)", len(targets))
         targets = self._drop_locked_sessions(targets)
         if not targets:
-            LOGGER.info("save: nothing left, all targets open in maki")
-            self._update_status("Nothing saved: session open in maki.")
+            LOGGER.info("save: nothing left, target open in maki")
+            self._update_status("Nothing saved: file is open in maki.")
             return
 
         status = safe_write.detect_maki()
@@ -959,6 +1070,7 @@ class MainWindow(QMainWindow):
                 self._update_status("No writable targets; close maki and retry.")
                 return
 
+        saved = {t.path for t in targets}
         try:
             result = safe_write.save_all(targets)
         except OSError as exc:
@@ -966,5 +1078,11 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Save failed", str(exc))
             return
         LOGGER.info("save ok: %s", result.describe())
-        self._reload()
+        # Only the saved files' baselines move: reloading the whole workspace
+        # would drop the unsaved edits still parked in other files.
+        for path in saved:
+            serialized = self._serialized(path)
+            if serialized is not None:
+                self._baseline[path] = serialized
+        self._refresh_marks()
         self._update_status(result.describe())

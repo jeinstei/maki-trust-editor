@@ -91,7 +91,7 @@ def test_tab_titles_are_clean_after_load(window: MainWindow) -> None:
 def test_edited_tab_title_gets_dirty_mark(window: MainWindow) -> None:
     _edit_global(window)
 
-    window._refresh_tab_titles()
+    window._refresh_marks()
 
     assert window.tabs.tabText(3) == "Global" + DIRTY_MARK
     assert window.tabs.tabText(0) == "Sessions"
@@ -107,6 +107,7 @@ def test_dirty_mark_clears_after_save(window: MainWindow, monkeypatch) -> None:
     window._mark_dirty()
     assert window.tabs.tabText(3) == "Global" + DIRTY_MARK
 
+    window.tabs.setCurrentIndex(3)
     window._save()
 
     assert window.tabs.tabText(3) == "Global"
