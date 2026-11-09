@@ -1,183 +1,194 @@
 # maki trust editor
 
-NOTE as of 9.11.2026: This app was created with directed AI coding and actual user testing. The code has
-not yet been reviewed by a human overall.
+NOTE as of 9.11.2026: This app was created with directed AI coding and actual
+user testing. The code has not yet been reviewed by a human overall.
 
-A small QtPy desktop app to **review and edit the permissions maki keeps** —
-session rules, per-project rules, global rules, folder trust, and the frozen
-pre-trust snapshot — in one clear window, with checkbox lists instead of
-hand-edited TOML.
+A small desktop app for **reviewing and changing the permissions maki keeps** —
+the rules for individual chat sessions, per-project rules, your global rules, and
+which folders maki is allowed to work in — all in one window, with simple
+checklists instead of hand-editing config files.
 
-maki has no built-in or plugin UI for this today: session rules live inside the
-session `.jsonl` files, folder trust lives in `trusted-folders.json`, and
-permissions live in `permissions.toml` files. This app reads all of them and
-writes them back safely.
+maki stores these rules in a few different files with no built-in way to edit
+them. This app reads all of them, shows you what is set, and writes your changes
+back safely.
 
-## What it edits
+## What you can do
 
-| Store | File | Written as |
-| --- | --- | --- |
-| Session rules | `<state>/sessions/**/*.jsonl` (the last `t:"meta"` line) | JSON, one line |
-| Project rules | `<repo>/.maki/permissions.toml` | TOML |
-| Global rules | `~/.config/maki/permissions.toml` (or `~/.maki/…`) | TOML |
-| Folder trust | `<state>/trusted-folders.json` | JSON |
-| Pre-trust roots | `<state>/sessions/pre-trust-roots.json` | JSON array |
+- **See and edit the rules for a session.** Open maki's session list, pick one,
+  and get its rules grouped by tool (e.g. `bash`, `read`) with an **Allow** /
+  **Deny** choice per entry.
+- **Edit a project's rules.** Rules that apply to one repo (its
+  `.maki/permissions.toml`).
+- **Edit your global rules.** The rules that apply everywhere.
+- **Manage folder trust.** Which folders maki trusts, which it rejects, and the
+  one-time "pre-trust" snapshot.
+- **Filter long lists.** A section picker and a `*`/`?` wildcard filter make a
+  big rule set easy to scan.
 
-`<state>` is resolved like maki resolves it, cross-platform: `~/.maki` if that
-directory exists, otherwise the platform state dir (XDG on Linux/BSD,
-`Application Support` on macOS, `%LOCALAPPDATA%` on Windows).
+## Getting started
 
-The pre-trust snapshot is the one-time record of project roots that predate
-folder trust; maki reads it at startup to grandfather those roots and freezes it
-itself if it is missing. The app shows it, and lets you add or remove roots, so a
-snapshot frozen wrongly can be corrected. Only root paths that exist on disk can
-be added.
-
-## Safety model
-
-Two things can go wrong when editing maki's files behind its back: maki
-Overwrites your edit, or maki's lock file races your write. This app handles
-both:
-
-- **Backups.** Every save copies the previous file to `<name>.bak`
-  next to the original before writing. Only one backup is kept per file, with
-  each save overwriting the previous backup.
-- **Only changed stores.** Save compares each store against what was loaded and
-  writes only the ones you actually changed, so an untouched file is never
-  rewritten or re-backed-up, and a file that did not exist is not created by an
-  unrelated edit.
-- **Atomic replace.** Writes go to a temp file in the same directory and are
-  renamed into place, so a crash never leaves a half-written file.
-- **A maki-closed guard.** The app detects a running `maki` process
-  (cross-platform: psutil, else `tasklist` on Windows / `pgrep` on POSIX) and
-  will not silently overwrite:
-  - **Shared** files (project/global `permissions.toml` and
-    `trusted-folders.json`) can be written by *any* maki process, so a running
-    maki blocks them. On Linux the guard checks `/proc/<pid>/fd` to see if maki
-    actually holds the specific file open; on other platforms, all shared files
-    are blocked whenever any maki process is running.
-  - **Session** files are only appended by the process that has them open, so a
-    running maki triggers a warning, not a hard block; you can choose to write
-    just the session files and skip the shared ones.
-
-The clean path is still: close every maki session, then edit.
-
-## Interface
-
-Four tabs, one **Save** button at the bottom:
-
-- **Sessions** — pick a session from the list; its rules appear grouped by tool
-  as a section default effect plus one row per scope, each row an **Allow** /
-  **Deny** choice (mutually exclusive) with a **Remove** button. A scope-less
-  rule ("every scope for this tool") is preserved as its own all-scopes control
-  rather than being dropped. Add a group with **+ Add tool group**. Switching
-  sessions with unsaved changes prompts for confirmation.
-- **Projects** — pick a discovered project (derived from session working
-  directories); edit its `.maki/permissions.toml` the same way, with
-  **+ Tool section** and **+ MCP server** to add sections, and a per-section
-  default effect and "allow every scope" switch. Switching projects with unsaved
-  changes prompts for confirmation to prevent accidental data loss.
-- **Folders** — the folder-trust document: every trusted folder (with its gated
-  files) and every rejected folder. Use **+ Add folder** to add new entries,
-  double-click to edit, or **Remove selected** to delete. Below it, a
-  **Pre-trust roots** section lists the frozen snapshot with **+ Add root** and
-  **Remove selected**.
-- **Global** — the user-wide `permissions.toml`. Like Projects, it has the
-  section picker and filter.
-
-**Keyboard shortcuts:** Ctrl+S to Save, Ctrl+R to Reload.
-
-**Filtering rules:** each rules view (Sessions, Projects, Global) has a
-**Section** picker to the right of its heading and a collapsible **Filter** box
-below it. The picker narrows to a single section (e.g. `bash`, `edit`,
-`mcp.github`). The filter matches scope text and section names with the familiar
-`*` (any run) and `?` (one character) wildcards — or a plain substring when you
-type no wildcard; it is applied on Enter, not on every keystroke. The two
-combine with AND. Filtering is purely visual — hidden sections and rows are
-still saved, and never count as edits. The filter text persists when you switch
-sessions or projects (so you can compare the same rule across sessions), and the
-shown rules are always recomputed against it; the section picker resets to
-**All sections** on switch.
-
-**Open sessions:** a running maki holds an advisory lock on
-`sessions/locks/<id>`, so the app can tell which sessions are live and marks them
-in the list with a padlock (falling back to a filled dot when the font lacks the
-glyph). Opening a session is unaffected — you can still view and edit it — but
-saving rules to a session that is open warns first, since maki may re-append on
-exit and clobber the change. Lock files are never deleted, so only a lock that is
-actually held counts as open.
-
-**Section defaults:** a `default` maki would reject (anything but
-`allow`/`deny`/`prompt`, e.g. an empty string) is shown as an `(invalid)` entry so
-the row stays visible; it is preserved verbatim on save unless you pick a real
-effect, rather than being silently dropped.
-
-**Unsaved-changes indicator:** a tab whose store has pending edits shows a
-trailing ` *` in its title (e.g. `Global *`); it clears as soon as Save writes
-that store. Switching sessions or projects with unsaved changes prompts for
-confirmation. Merely opening a session never marks it changed: the baseline is
-the canonical rendering (rules grouped by tool and sorted), so the order the
-rules happen to be stored in is not mistaken for an edit. A store with no
-baseline (a session file that is missing or has no meta line) is likewise never
-changed.
-
-**Validation:** Tool and MCP server names are validated to ensure they form valid
-TOML section names; duplicate section names are prevented. Pre-trust roots must
-be existing directories.
-
-**Malformed stores:** if a store fails to parse on load (bad TOML or JSON), the
-app falls back to an empty store for that file and warns you with the path and
-the parse error, so one broken file never blocks the rest of the workspace.
-
-**Ctrl-C and closing:** Ctrl-C asks the window to close, honoring the same
-unsaved-changes prompt. Cancelling the prompt returns the app to exactly the
-state it was in before, with Ctrl-C still armed for another try. Pressing Ctrl-C
-a second time while the prompt is open skips the guard and closes immediately.
-
-## Running it
-
-The app is built on [QtPy](https://github.com/spyder-ide/qtpy), so it runs
-against **whichever Qt binding you have** — PySide6, PyQt6, or their older
-siblings. Nothing in the source imports a specific binding; QtPy selects one at
-runtime (set `QT_API` to force a choice).
-
-### Without installing anything
-
-Both launchers run straight from source. Neither installs the package into your
-environment.
+You need Python and one Qt binding (PySide6 or PyQt6). The easiest way:
 
 ```sh
 ./run_app.sh                 # uses an existing .venv, else an ephemeral uv env
-./run_app.py                 # any Python that already has the deps
 ```
 
-`run_app.sh` prefers a venv created by `uv sync`; if none exists it builds a
-throwaway environment with `uv run --with …` and discards it after the run. It
-takes `--extra pyside6|pyqt6` (or `MAKI_TRUST_EDITOR_QT`) to pick a binding.
-
-`run_app.py` adds `src/` to the import path itself, so no install is needed, and
-prints the exact fix command if a dependency is missing.
-
-You can also skip the scripts entirely:
+Or, if you already have the dependencies in your environment:
 
 ```sh
-uv run --with pyside6 --with qtpy --with tomlkit --with psutil run_app.py
+./run_app.py
 ```
 
-### Installing it (optional)
+You can also install it:
 
 ```sh
 uv sync --extra pyside6      # or --extra pyqt6
 uv run maki-trust-editor
 ```
 
-Or without the console script:
+The app is built on [QtPy](https://github.com/spyder-ide/qtpy), so it runs
+against whichever Qt binding you have; nothing in the source picks one for you.
+Set `QT_API` to force a specific binding.
 
-```sh
-uv run python -m maki_trust_editor
-```
+## How the app is laid out
 
-## Layout
+There are four tabs along the top and a **Save** button at the bottom:
+
+- **Sessions** — every maki session, newest first. Pick one to see and edit its
+  rules.
+- **Projects** — every project maki has seen (found from session working
+  directories). Pick one to edit its `.maki/permissions.toml`.
+- **Folders** — the folder-trust list and the pre-trust snapshot.
+- **Global** — your user-wide rules.
+
+**Save** writes the file for the tab you are on (see *Saving* below).
+
+**Keyboard:** Ctrl+S saves, Ctrl+R reloads everything from disk.
+
+## Editing rules
+
+Each rules view groups rules into a section per tool (for example `bash` or
+`edit`, or `mcp.github` for an MCP server). Each section has:
+
+- a **section default** (what happens when no entry matches), and
+- one row per scope, each an **Allow** / **Deny** choice.
+
+A rule that applies to every scope of a tool is kept as its own "all scopes"
+control, so it is never lost.
+
+In **Sessions**, add a tool group with **+ Add tool group**. In **Projects** and
+**Global**, add sections with **+ Tool section** and **+ MCP server**; tool and
+server names may contain letters, digits, underscores and hyphens, and must start
+with a letter, digit or underscore — duplicates are rejected.
+
+**Finding things:** to the right of a section heading is a **Section** picker
+that narrows the view to one tool, and a collapsible **Filter** box (the
+**Filter** button opens it) that matches scope text and section names. Filter
+accepts `*` (any run of characters) and `?` (one character) wildcards, or plain
+text for a substring match, and is applied when you press Enter. Filtering only
+hides things — hidden rules are still saved and never count as an edit. The
+filter text stays when you switch sessions or projects; the section picker resets
+to **All sections**.
+
+## Saving
+
+**Save is per file.** It writes only the file for the current selection — the
+session you have open on the **Sessions** tab, the project on the **Projects**
+tab, the global file on **Global**, and both folder files at once on **Folders**.
+
+Your edits are **not thrown away when you switch away**. If you edit session A,
+switch to session B, and come back, A still has your change. Any file with
+unsaved changes is marked with a trailing ` *` — both in the tab title (e.g.
+`Sessions *`) and next to the item in the list — until you save that file.
+
+Nothing but a changed file is written: on Save, maki-trust-editor compares each
+file against what it loaded and writes only the ones you actually changed, so
+untouched files are never rewritten or backed up.
+
+## Staying safe
+
+Editing maki's files while maki is running can go wrong in two ways: maki may
+overwrite your edit, or the two may write at the same time. The app protects
+against both:
+
+- **Backups.** Before writing, the previous file is copied to `<name>.bak` beside
+  it (one backup per file, replaced on each save).
+- **Atomic writes.** Changes go to a temporary file and are renamed into place,
+  so a crash never leaves a half-written file.
+- **A "maki is running" guard.** The app looks for a running `maki` process and
+  refuses to silently overwrite:
+  - **Shared** files (project/global `permissions.toml` and the folder-trust
+    file) can be written by any maki process, so a running maki blocks them.
+    On Linux the app also checks whether maki actually holds that file open.
+  - **Session** files are only appended by the process that has them open, so a
+    running maki only warns; you can still choose to write.
+
+The cleanest approach is still to close all maki sessions before editing.
+
+**Open sessions are read-only here.** When maki has a session open, the app marks
+it in the list with a padlock (or a filled dot if your font has no padlock) and
+shows its rules **read-only** — you can look, but not change them, and they are
+never saved, because maki would overwrite your change anyway. maki leaves these
+lock files behind, so only a lock that is *currently held* counts as open.
+
+## Good to know
+
+- **Session defaults.** If a session or section has a `default` maki would reject
+  (anything other than `allow`, `deny` or `prompt` — for example an empty
+  string), the app shows it as an `(invalid)` entry so the row stays visible and
+  the value is preserved exactly unless you pick a real effect.
+- **Broken files.** If a file fails to load (bad TOML or JSON), the app opens it
+  as empty and warns you with the path and the error, so one bad file never
+  blocks the rest.
+- **Unknown settings are kept.** Keys the app does not model are preserved
+  verbatim when you save.
+- **Big sessions open instantly.** Opening a session reads only its first and
+  last lines, not the whole transcript, so an 80 MB session opens as fast as a
+  small one. Saving rewrites only the rules line and streams the rest of the file
+  through untouched, byte for byte.
+- **Folder paths** and gated file names are free-form text.
+- **Session rules** only offer `allow` and `deny` per scope (maki's session
+  format has no `prompt` there); `prompt` is available only as a section default
+  in `permissions.toml`.
+- **Ctrl-C** asks the window to close and honours the unsaved-changes prompt.
+  Pressing Ctrl-C a second time while the prompt is open closes immediately.
+
+## Closing with unsaved changes
+
+If you close the window with unsaved changes, the app asks first. Cancelling
+returns you to exactly where you were.
+
+## Where things live
+
+| What | File |
+| --- | --- |
+| Session rules | `<state>/sessions/**/*.jsonl` (the last `t:"meta"` line) |
+| Project rules | `<repo>/.maki/permissions.toml` |
+| Global rules | `~/.config/maki/permissions.toml` (or `~/.maki/…`) |
+| Folder trust | `<state>/trusted-folders.json` |
+| Pre-trust roots | `<state>/sessions/pre-trust-roots.json` |
+
+`<state>` is resolved the same way maki resolves it: `~/.maki` if that directory
+exists, otherwise the platform state directory (XDG on Linux/BSD, `Application
+Support` on macOS, `%LOCALAPPDATA%` on Windows). The "pre-trust roots" snapshot
+is a one-time record of project roots that existed before folder trust; maki uses
+it to keep trusting those roots. The app shows it and lets you add or remove
+roots (only directories that exist can be added).
+
+## Log and troubleshooting
+
+The app writes a rotating log (three 1 MB files) in its **own** state directory,
+separate from maki's:
+
+- Linux: `~/.local/state/maki-trust-editor/maki-trust-editor.log`
+- macOS: `~/Library/Application Support/maki-trust-editor/maki-trust-editor.log`
+- Windows: `%LOCALAPPDATA%\maki-trust-editor\maki-trust-editor.log`
+
+It records the session locks at startup, every save and its result, and any file
+that failed to load, including uncaught crashes — useful because a windowed app
+has no console.
+
+## Project layout (for developers)
 
 ```
 run_app.sh         launcher: existing venv, else ephemeral uv env
@@ -194,39 +205,4 @@ src/maki_trust_editor/
   app.py           entry point, logging, Ctrl-C handling
 ```
 
-## Logging
-
-The app logs to a rotating file in its own state directory — not maki's, so
-nothing there is disturbed:
-
-- Linux: `~/.local/state/maki-trust-editor/maki-trust-editor.log`
-- macOS: `~/Library/Application Support/maki-trust-editor/maki-trust-editor.log`
-- Windows: `%LOCALAPPDATA%\maki-trust-editor\maki-trust-editor.log`
-
-It records the state of the session locks at startup (how many sessions, which
-ids are open), each save (targets and result), the warning when saving to an
-open session, and any file that failed to load. Uncaught exceptions are written
-here too, so a crash leaves a trace even though a GUI has no console. The log
-keeps three rotated backups of 1 MB each.
-
-## Caveats
-
-- Editing a session's last meta line changes the rules maki will load on resume;
-  if that session is open, close it first or your change may be overwritten.
-- Opening a session reads only its first line (the header) and its last line (the
-  current state); the megabytes in between are never loaded, so an 80 MB
-  transcript opens as fast as a small one. Saving rewrites only that last line
-  and streams the rest through untouched, so every other byte — including any
-  non-UTF-8 encoding maki wrote — is preserved exactly.
-- The app never runs maki. It reads maki's lock files to tell which sessions are
-  open, but never takes or writes a lock; it only reads and writes the data
-  files, guarded as described above.
-- `permissions.toml` keys the app does not model are preserved verbatim on save,
-  both unknown top-level keys and unknown keys inside a tool/MCP section.
-- Tool and MCP server section names must contain only word characters (letters,
-  digits, underscore) and hyphens, and must start with a word character.
-- Folder paths and gated file names are free-form strings compatible with
-  maki's internal representation.
-- Session rules only allow `allow` and `deny` (maki's session format has no
-  per-scope `prompt`); `prompt` is offered only as a section default in
-  `permissions.toml`.
+See `AGENTS.md` for the internal design, invariants and gotchas.
