@@ -59,9 +59,9 @@ def matches(matcher: re.Pattern[str] | None, text: str) -> bool:
 # All-scopes control offers only these two; ``prompt`` is a section-default-only
 # effect, so it must never appear here.
 SCOPE_EFFECTS = (EFFECT_ALLOW, EFFECT_DENY)
-ALL_SCOPES_LABELS = ("All scopes: (unset)", "All scopes: allow", "All scopes: deny")
 # Section-default control: absent key, an invalid stored value (e.g. ""), then
-# the three effects maki accepts.
+# the three effects maki accepts. These are compared by text (``default()``,
+# ``findText``), so they stay stable English, like the effect names themselves.
 UNSET_LABEL = "(unset)"
 INVALID_LABEL = "(invalid)"
 DEFAULT_LABELS = (UNSET_LABEL, INVALID_LABEL, *EFFECTS)
@@ -78,12 +78,12 @@ class ScopeRow(QWidget):
         layout.setSpacing(8)
 
         self.scope_edit = QLineEdit(scope)
-        self.scope_edit.setPlaceholderText("scope pattern, e.g. git *  or  /path/**")
+        self.scope_edit.setPlaceholderText(self.tr("scope pattern, e.g. git *  or  /path/**"))
         self.scope_edit.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.scope_edit.editingFinished.connect(self._changed)
 
-        self.allow_box = QCheckBox("Allow")
-        self.deny_box = QCheckBox("Deny")
+        self.allow_box = QCheckBox(self.tr("Allow"))
+        self.deny_box = QCheckBox(self.tr("Deny"))
         # Scopes are only ever allow or deny; anything else (a malformed file)
         # falls back to allow rather than leaving both boxes unchecked.
         self.allow_box.setChecked(effect != EFFECT_DENY)
@@ -91,7 +91,7 @@ class ScopeRow(QWidget):
         self.allow_box.stateChanged.connect(self._allow_toggled)
         self.deny_box.stateChanged.connect(self._deny_toggled)
 
-        self._remove = QPushButton("Remove")
+        self._remove = QPushButton(self.tr("Remove"))
         self._remove.setFixedWidth(80)
         self._remove.clicked.connect(lambda: on_remove(self))
 
@@ -157,10 +157,16 @@ class ScopeRulesEditor(QWidget):
         self.default_box.addItems(DEFAULT_LABELS)
         self.default_box.currentIndexChanged.connect(lambda _: self._notify())
         self.all_box = QComboBox()
-        self.all_box.addItems(ALL_SCOPES_LABELS)
+        self.all_box.addItems(
+            (
+                self.tr("All scopes: (unset)"),
+                self.tr("All scopes: allow"),
+                self.tr("All scopes: deny"),
+            )
+        )
         self.all_box.currentIndexChanged.connect(lambda _: self._notify())
 
-        header.addWidget(QLabel("Section default:"))
+        header.addWidget(QLabel(self.tr("Section default:")))
         header.addWidget(self.default_box)
         header.addWidget(self.all_box)
         header.addStretch(1)
@@ -170,7 +176,7 @@ class ScopeRulesEditor(QWidget):
         self._rows_box.setSpacing(0)
         outer.addLayout(self._rows_box)
 
-        self._add = QPushButton("+ Add scope")
+        self._add = QPushButton(self.tr("+ Add scope"))
         self._add.clicked.connect(lambda: self.add_row("", EFFECT_ALLOW))
         outer.addWidget(self._add, alignment=Qt.AlignmentFlag.AlignLeft)
 
@@ -187,7 +193,9 @@ class ScopeRulesEditor(QWidget):
             self._unknown_label.hide()
             return
         rendered = ", ".join(sorted(keys))
-        self._unknown_label.setText(f"preserved keys (not editable): {rendered}")
+        self._unknown_label.setText(
+            self.tr("preserved keys (not editable): {keys}").format(keys=rendered)
+        )
         self._unknown_label.show()
 
     def set_section(self, default: str | None, all_effect: str | None) -> None:
@@ -283,9 +291,10 @@ class ScopedHolder(QWidget):
 
     ALL_SECTIONS = "All sections"
 
-    def __init__(self, title: str) -> None:
+    def __init__(self, title: str, empty_hint: str = "") -> None:
         super().__init__()
         self._sections: list[tuple[str, QFrame, ScopeRulesEditor]] = []
+        self._read_only = False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -296,18 +305,20 @@ class ScopedHolder(QWidget):
         heading_row.addWidget(heading)
         heading_row.addStretch(1)
         self.section_box = QComboBox()
-        self.section_box.setToolTip("Show only one rule section")
+        self.section_box.setToolTip(self.tr("Show only one rule section"))
         self.section_box.addItem(self.ALL_SECTIONS)
         self.section_box.currentIndexChanged.connect(lambda _: self._apply())
         heading_row.addWidget(self.section_box)
-        self._toggle = QPushButton("Filter")
+        self._toggle = QPushButton(self.tr("Filter"))
         self._toggle.setCheckable(True)
         self._toggle.toggled.connect(self._toggle_filter)
         heading_row.addWidget(self._toggle)
         layout.addLayout(heading_row)
 
         self.filter_box = QLineEdit()
-        self.filter_box.setPlaceholderText("filter rules (* and ? wildcards, Enter to apply)")
+        self.filter_box.setPlaceholderText(
+            self.tr("filter rules (* and ? wildcards, Enter to apply)")
+        )
         self.filter_box.setClearButtonEnabled(True)
         self.filter_box.returnPressed.connect(self._apply)
         self.filter_box.textChanged.connect(self._filter_text_changed)
@@ -321,7 +332,13 @@ class ScopedHolder(QWidget):
         self._inner_layout = QVBoxLayout(self._inner)
         self._inner_layout.setContentsMargins(8, 8, 8, 8)
         self._inner_layout.setSpacing(12)
-        self._inner_layout.addStretch(1)
+        self._empty_hint = QLabel(empty_hint)
+        self._empty_hint.setWordWrap(True)
+        self._empty_hint.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self._empty_hint.setStyleSheet("color: #888;")
+        self._empty_hint.setVisible(bool(empty_hint))
+        self._inner_layout.addWidget(self._empty_hint)
+        self._stretch = self._inner_layout.addStretch(1)
         self._scroll.setWidget(self._inner)
         layout.addWidget(self._scroll)
 
@@ -334,24 +351,41 @@ class ScopedHolder(QWidget):
         name.setStyleSheet("font-weight: 600;")
         box_layout.addWidget(name)
         box_layout.addWidget(editor)
-        self._inner_layout.insertWidget(self._inner_layout.count() - 1, box)
+        self._inner_layout.insertWidget(self._inner_layout.indexOf(self._stretch), box)
         self._sections.append((label, box, editor))
+        self._empty_hint.setVisible(False)
         self._rebuild_section_box()
 
     def clear_editors(self) -> None:
-        while self._inner_layout.count() > 1:
-            item = self._inner_layout.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.setParent(None)
-                widget.deleteLater()
+        # Remove exactly the section boxes, by identity. Indexing the layout
+        # instead (takeAt) is fragile: the hint and the trailing stretch move
+        # as sections come and go, so a fixed index eventually removes the
+        # wrong one and orphans a box in the scroll area.
+        for _, box, _ in self._sections:
+            self._inner_layout.removeWidget(box)
+            box.setParent(None)
+            box.deleteLater()
         self._sections.clear()
+        self._empty_hint.setVisible(bool(self._empty_hint.text()))
         self._rebuild_section_box()
 
     def set_read_only(self, read_only: bool) -> None:
         """Make every section uneditable (used for a session maki holds open)."""
+        self._read_only = read_only
         for _, _, editor in self._sections:
             editor.set_read_only(read_only)
+
+    def is_read_only(self) -> bool:
+        return self._read_only
+
+    def set_empty_hint(self, text: str) -> None:
+        """Replace the placeholder shown while there are no sections.
+
+        An empty string hides it: used when there is nothing to add rules to
+        (no project selected), where "add a tool below" would be misleading.
+        """
+        self._empty_hint.setText(text)
+        self._empty_hint.setVisible(bool(text) and not self._sections)
 
     def refresh(self) -> None:
         """Re-apply the current filter and picker to the loaded sections.

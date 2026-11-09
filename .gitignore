@@ -4,3 +4,8 @@ __pycache__/
 .pytest_cache/
 pytest-of-*/
 tmp*
+dist/
+build/
+*.egg-info/
+# Compiled catalogs are build output; the .ts sources are tracked.
+src/maki_trust_editor/translations/*.qm

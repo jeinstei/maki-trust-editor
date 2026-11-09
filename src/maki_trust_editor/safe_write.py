@@ -55,6 +55,9 @@ def _stems() -> set[str]:
 
 
 def _pids_via_psutil() -> list[int] | None:
+    # psutil is an optional extra: present, it gives one cross-platform path;
+    # absent, detect_maki falls back to native commands. Return None means
+    # "not installed", not "no match".
     try:
         import psutil  # type: ignore
     except ImportError:
@@ -156,23 +159,37 @@ class WriteTarget:
     writer: Callable[[], None] | None = field(default=None, compare=False)
 
 
+def _real_target(path: Path) -> Path:
+    """The file a write must land on, following a symlink to its target.
+
+    ``os.replace`` would otherwise replace the symlink itself with a regular
+    file, silently breaking a dotfile-managed ``permissions.toml`` link. A path
+    that does not exist yet is returned unchanged (nothing to resolve).
+    """
+    if path.is_symlink():
+        return path.resolve()
+    return path
+
+
 def backup_path(path: Path) -> Path:
     return path.with_name(path.name + BACKUP_SUFFIX)
 
 
 def make_backup(path: Path) -> Path | None:
-    if not path.is_file():
+    real = _real_target(path)
+    if not real.is_file():
         return None
-    target = backup_path(path)
-    shutil.copy2(path, target)
+    target = backup_path(real)
+    shutil.copy2(real, target)
     return target
 
 
 def atomic_write_text(path: Path, content: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
+    real = _real_target(path)
+    real.parent.mkdir(parents=True, exist_ok=True)
+    tmp = real.with_name(real.name + ".tmp")
     tmp.write_text(content, encoding="utf-8", newline="\n")
-    os.replace(tmp, path)
+    os.replace(tmp, real)
 
 
 @dataclass
@@ -195,7 +212,8 @@ def blocked_targets(targets: list[WriteTarget], status: MakiStatus) -> list[Writ
     return [t for t in targets if t.shared]
 
 
-def save_all(targets: list[WriteTarget]) -> SaveResult:
+def write_targets(targets: list[WriteTarget]) -> SaveResult:
+    """Back up and write each target; the caller decides which (usually one)."""
     backups: list[Path] = []
     for target in targets:
         backup = make_backup(target.path)

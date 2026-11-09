@@ -29,6 +29,9 @@ DOCUMENT_VERSION = 2
 class FolderEntry:
     path: str
     files: list[str] = field(default_factory=list)
+    # Keys inside the entry we do not model, kept verbatim so a save never drops
+    # a field a newer maki wrote.
+    unknown: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -55,6 +58,7 @@ class TrustDocument:
                 FolderEntry(
                     path=str(entry.get("path", "")),
                     files=[str(f) for f in entry.get("files", [])],
+                    unknown={k: v for k, v in entry.items() if k not in ("path", "files")},
                 )
             )
         doc.rejected = [str(p) for p in raw.get("rejected", [])]
@@ -66,7 +70,9 @@ class TrustDocument:
     def to_json(self) -> str:
         payload: dict = {"version": self.version}
         payload.update(self._unknown)
-        payload["folders"] = [{"path": e.path, "files": list(e.files)} for e in self.folders]
+        payload["folders"] = [
+            {"path": e.path, "files": list(e.files), **e.unknown} for e in self.folders
+        ]
         payload["rejected"] = list(self.rejected)
         return json.dumps(payload, indent=2) + "\n"
 

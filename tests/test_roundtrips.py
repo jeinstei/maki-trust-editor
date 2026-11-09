@@ -143,7 +143,7 @@ def test_folder_trust_removes_folder_and_rejection(tmp_path: Path) -> None:
 def test_safe_write_keeps_a_backup(tmp_path: Path) -> None:
     path = tmp_path / "permissions.toml"
     path.write_text("old\n", encoding="utf-8")
-    result = safe_write.save_all([safe_write.WriteTarget(path=path, content="new\n")])
+    result = safe_write.write_targets([safe_write.WriteTarget(path=path, content="new\n")])
     assert path.read_text() == "new\n"
     assert len(result.backups) == 1
     assert result.backups[0].read_text() == "old\n"
@@ -203,3 +203,40 @@ def test_pre_trust_roots_load_and_roundtrip(tmp_path: Path, case: str) -> None:
 
     reloaded = json.loads(roots.to_json())
     assert reloaded == sorted(set(roots.roots))
+
+
+def test_folder_entry_preserves_unknown_keys(tmp_path: Path) -> None:
+    """A per-folder field maki adds must survive a save, not just doc-level keys."""
+    path = tmp_path / "trusted-folders.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "folders": [{"path": "/a", "files": ["permissions"], "future": {"x": 1}}],
+                "rejected": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    doc = folders.TrustDocument.load(path)
+    doc.add_or_update_folder("/a", ["permissions", "sessions"])
+
+    entry = json.loads(doc.to_json())["folders"][0]
+    assert entry["files"] == ["permissions", "sessions"]
+    assert entry["future"] == {"x": 1}
+
+
+def test_safe_write_follows_a_symlink_without_breaking_it(tmp_path: Path) -> None:
+    """Writing a symlinked target must update the real file and keep the link."""
+    real = tmp_path / "real.toml"
+    real.write_text("old\n", encoding="utf-8")
+    link = tmp_path / "link.toml"
+    link.symlink_to(real)
+
+    result = safe_write.write_targets([safe_write.WriteTarget(path=link, content="new\n")])
+
+    assert link.is_symlink(), "the symlink was replaced by a regular file"
+    assert real.read_text() == "new\n"
+    assert link.read_text() == "new\n"
+    assert result.backups == [tmp_path / "real.toml.bak"]
+    assert result.backups[0].read_text() == "old\n"

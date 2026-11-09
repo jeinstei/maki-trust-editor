@@ -7,14 +7,19 @@ requires-python = ">=3.10"
 dependencies = [
     "qtpy>=2.4",
     "tomlkit>=0.12",
-    "psutil>=5.9",
 ]
 
 [project.optional-dependencies]
 # Pick exactly one Qt binding. PySide6 is the default recommendation.
 pyside6 = ["PySide6>=6.6"]
 pyqt6 = ["PyQt6>=6.6"]
+# Optional: process detection uses psutil when present, else native commands
+# (pgrep / tasklist). See safe_write.detect_maki.
+psutil = ["psutil>=5.9"]
 dev = ["pytest>=8", "black>=24", "ruff>=0.6"]
+# Translations are optional and English-only by default. The .ts -> .qm tools
+# (pylupdate6, lrelease) ship with Qt itself, not pip: PyQt6 bundles pylupdate6,
+# and lrelease comes with a Qt install / distro package. See scripts/build_translations.py.
 
 [project.scripts]
 maki-trust-editor = "maki_trust_editor.app:main"
@@ -25,6 +30,11 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/maki_trust_editor"]
+# Ship compiled catalogs (and the .ts sources) so translations work from a wheel.
+include = [
+    "src/maki_trust_editor/translations/*.qm",
+    "src/maki_trust_editor/translations/*.ts",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

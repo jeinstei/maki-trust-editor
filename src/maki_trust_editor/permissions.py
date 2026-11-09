@@ -16,6 +16,12 @@ The file has three shapes, all of which maki round-trips:
 
 We keep the parsed form close to the file so an edit writes back only what the
 user changed, and we never invent sections maki would reject.
+
+A save re-serializes from the parsed model, so the file is rewritten in a
+**canonical** form: keys and tables are sorted and comments (leading or inline)
+are not preserved. Unknown keys — top-level and per section — *are* kept, so a
+key a newer maki wrote survives. maki reads the file through toml, so the
+reordering is harmless; only the comments are lost.
 """
 
 from __future__ import annotations

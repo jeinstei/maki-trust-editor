@@ -14,11 +14,12 @@ file up first and refuses while a maki process is running.
 
 from __future__ import annotations
 
+import datetime
 import logging
 import re
 import time
 
-from qtpy.QtCore import Qt
+from qtpy.QtCore import Qt, QTimer
 from qtpy.QtGui import QFontMetrics, QKeySequence, QShortcut
 from qtpy.QtWidgets import (
     QApplication,
@@ -48,13 +49,22 @@ from .permissions import EFFECT_ALLOW, McpServerRules, ToolRules
 from .widgets import ScopedHolder, ScopeRulesEditor
 
 MAKI_STATUS_TTL = 2.0
+# How often the live-refresh tick re-probes maki and the visible sessions. Fast
+# enough that a lock acquired mid-edit shows within a couple of seconds, slow
+# enough that the process-table scan is negligible while idle.
+LIVENESS_POLL_MS = 2000
 TOOL_NAME_RE = re.compile(r"^\w[\w-]*$")
 DIRTY_MARK = " *"
+# The id a session was named by embeds a UUIDv7 timestamp in milliseconds while
+# the header records ``created_at`` in whole seconds, so the two differ by under
+# a second even when they agree. Anything past this is a real disagreement.
+CREATED_AT_TOLERANCE_S = 2
 # Tab labels in addTab order, so titles can be rebuilt with the dirty marker
 # without repeating the strings.
 TAB_TITLES = ("Sessions", "Projects", "Folders", "Global")
 SESSIONS_TAB = TAB_TITLES.index("Sessions")
 PROJECTS_TAB = TAB_TITLES.index("Projects")
+FOLDERS_TAB = TAB_TITLES.index("Folders")
 GLOBAL_TAB = TAB_TITLES.index("Global")
 
 # Marks a session another maki holds open. The padlock is the clear glyph; the
@@ -104,6 +114,9 @@ class PermissionsTab(QWidget):
         self._empty_hint = empty_hint
         self._on_change = on_change or (lambda: None)
         self._file: permissions.PermissionsFile | None = None
+        self._rules_hint = self.tr(
+            "No rules yet — use the + buttons below to add a tool or MCP server."
+        )
 
         layout = QVBoxLayout(self)
         self.path_label = QLabel(empty_hint)
@@ -112,7 +125,7 @@ class PermissionsTab(QWidget):
         self.path_label.setStyleSheet("font-family: monospace; color: #888;")
         layout.addWidget(self.path_label)
 
-        self.scoped = ScopedHolder("Rules")
+        self.scoped = ScopedHolder("Rules", self._rules_hint)
         layout.addWidget(self.scoped)
         self._editors: list[tuple[str, ScopeRulesEditor, bool]] = []
 
@@ -122,9 +135,13 @@ class PermissionsTab(QWidget):
         self._editors.clear()
         if file is None:
             self.path_label.setText(self._empty_hint)
+            self.scoped.set_empty_hint("")
             return
-        state = "exists" if file.exists else "will be created on save"
-        self.path_label.setText(f"file: {file.path}\n({state})")
+        self.scoped.set_empty_hint(self._rules_hint)
+        state = self.tr("exists") if file.exists else self.tr("will be created on save")
+        self.path_label.setText(
+            self.tr("file: {path}\n({state})").format(path=file.path, state=state)
+        )
         for name in sorted(file.tools):
             self._add_tool(name, file.tools[name])
         for server in sorted(file.mcp):
@@ -163,16 +180,16 @@ class PermissionsTab(QWidget):
 
     def _add_section(self, name: str, is_mcp: bool) -> str | None:
         if self._file is None:
-            return "Select a project first."
+            return self.tr("Select a project first.")
         if not TOOL_NAME_RE.match(name):
-            return (
+            return self.tr(
                 "Names must start with a letter, digit or underscore and contain "
                 "only letters, digits, underscores and hyphens."
             )
         if name in self._file.tools:
-            return f"A tool section named '{name}' already exists."
+            return self.tr("A tool section named '{name}' already exists.").format(name=name)
         if name in self._file.mcp:
-            return f"An MCP section named '{name}' already exists."
+            return self.tr("An MCP section named '{name}' already exists.").format(name=name)
         if is_mcp:
             self._file.mcp[name] = McpServerRules(server=name)
             self._add_mcp(name, self._file.mcp[name])
@@ -230,7 +247,7 @@ class SessionsTab(QWidget):
 
         left = QWidget()
         left_layout = QVBoxLayout(left)
-        left_layout.addWidget(QLabel("Sessions"))
+        left_layout.addWidget(QLabel(self.tr("Sessions")))
         self.list = QListWidget()
         self.list.currentRowChanged.connect(self._selected)
         left_layout.addWidget(self.list)
@@ -238,20 +255,24 @@ class SessionsTab(QWidget):
 
         right = QWidget()
         right_layout = QVBoxLayout(right)
-        self.file_label = QLabel("file: (none)")
+        self.file_label = QLabel(self.tr("file: (none)"))
         self.file_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.file_label.setStyleSheet("font-family: monospace; color: #888;")
         self.file_label.setWordWrap(True)
         right_layout.addWidget(self.file_label)
-        self.header = QLabel("Select a session")
+        self.header = QLabel(self.tr("Select a session"))
+        self.header.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.header.setWordWrap(True)
         right_layout.addWidget(self.header)
-        self.scoped = ScopedHolder("Session rules (allow/deny per scope)")
+        self._rules_hint = self.tr("No rules yet — use '+ Add tool group' below to start.")
+        self.scoped = ScopedHolder(
+            self.tr("Session rules (allow/deny per scope)"), self._rules_hint
+        )
         right_layout.addWidget(self.scoped)
         self._editors: list[tuple[str, ScopeRulesEditor]] = []
         self._on_rules_changed = on_rules_changed
 
-        self._add_button = QPushButton("+ Add tool group")
+        self._add_button = QPushButton(self.tr("+ Add tool group"))
         self._add_button.clicked.connect(self._add_group)
         self._add_button.setEnabled(False)
         right_layout.addWidget(self._add_button, alignment=Qt.AlignmentFlag.AlignLeft)
@@ -266,12 +287,30 @@ class SessionsTab(QWidget):
         self.list.blockSignals(True)
         self.list.clear()
         for view in views:
-            self._labels.append(f"{_lock_prefix(view.locked)}{view.label}\n{view.subtitle}")
+            self._labels.append(self.label_for(view))
             item = QListWidgetItem(self._labels[-1])
-            item.setToolTip(("open in maki\n" if view.locked else "") + view.subtitle)
+            item.setToolTip(self._tooltip_for(view))
             self.list.addItem(item)
         self.list.blockSignals(False)
         self._selected(self.list.currentRow())
+
+    def label_for(self, view: workspace.SessionView) -> str:
+        return f"{_lock_prefix(view.locked)}{view.label}\n{view.subtitle}"
+
+    def _tooltip_for(self, view: workspace.SessionView) -> str:
+        return (self.tr("open in maki\n") if view.locked else "") + view.subtitle
+
+    def sync_labels(self) -> None:
+        """Rewrite the row text and tooltip from the current views.
+
+        The lock glyph and tooltip are derived from each view, so a lock the
+        poll acquired or released is only visible after this runs.
+        """
+        self._labels = [self.label_for(view) for view in self._views]
+        for row, view in enumerate(self._views):
+            item = self.list.item(row)
+            item.setText(self._labels[row])
+            item.setToolTip(self._tooltip_for(view))
 
     def row_label(self, row: int) -> str:
         return self._labels[row]
@@ -291,8 +330,9 @@ class SessionsTab(QWidget):
         if row < 0 or row >= len(self._views):
             self._current = None
             self._add_button.setEnabled(False)
-            self.file_label.setText("file: (none)")
-            self.header.setText("Select a session")
+            self.file_label.setText(self.tr("file: (none)"))
+            self.header.setText(self.tr("Select a session"))
+            self.scoped.set_empty_hint("")
             self.loading = False
             return
         view = self._views[row]
@@ -304,11 +344,9 @@ class SessionsTab(QWidget):
             view.reload()
         session = view.session
         self._current = session
-        self.file_label.setText(f"file: {session.path}")
-        self.header.setText(
-            f"{session.session_id}\ncwd: {session.cwd}\nmodel: {session.model}\n"
-            f"{len(session.rules)} rule(s)"
-        )
+        self.scoped.set_empty_hint(self._rules_hint)
+        self.file_label.setText(self.tr("file: {path}").format(path=session.path))
+        self.header.setText(self._session_header(session))
         for group in sessions.ToolGroup.group(session.rules):
             editor = ScopeRulesEditor(self._on_rules_changed)
             editor.set_section(None, group.all_effect)
@@ -318,11 +356,67 @@ class SessionsTab(QWidget):
             self._editors.append((group.tool, editor))
         # A session maki holds open is shown but not editable: any write would
         # race with maki re-appending to the same file on exit.
-        read_only = view.locked
-        self.scoped.set_read_only(read_only)
-        self._add_button.setEnabled(not read_only)
+        self.set_read_only(view.locked)
         self.scoped.refresh()
         self.loading = False
+
+    def set_read_only(self, read_only: bool) -> None:
+        """Enable or disable editing of the shown session in place."""
+        self.scoped.set_read_only(read_only)
+        self._add_button.setEnabled(not read_only)
+
+    def _id_line(self, session_id: str) -> str:
+        """The session id, shown with the UUID it decodes to.
+
+        A base58 id (what maki writes now) is opaque, so the decoded UUID and
+        version are appended: ``<raw> - <uuid> (vN)``. When the raw form already
+        *is* the UUID (a legacy hex id) the two would read as a duplicate, so
+        only the single ``<uuid> (vN)`` is shown. An id that does not parse is
+        shown raw and nothing more.
+        """
+        decoded = sessions.decode_session_id(session_id)
+        if decoded is None:
+            return session_id
+        labelled = f"{decoded.uuid} (v{decoded.version})"
+        if decoded.uuid == session_id.lower():
+            return labelled
+        return f"{session_id} - {labelled}"
+
+    def _created_line(self, session_id: str, created_at: int) -> str:
+        """The creation time decoded from the id, and whether it matches the header.
+
+        The id encodes the time it was generated; the header records its own
+        ``created_at``. They should agree, so a disagreement is called out: it
+        means the id and the header did not come from the same creation. A
+        legacy id carries no time of its own, which is reported as ``(none)``
+        rather than mismatched.
+        """
+        decoded = sessions.decode_session_id(session_id)
+        if decoded is None or decoded.created is None:
+            return self.tr("created: (none)")
+        stamp = decoded.created.strftime("%Y-%m-%d %H:%M:%S UTC")
+        text = self.tr("created: {stamp}").format(stamp=stamp)
+        if created_at:
+            delta = abs(decoded.created.timestamp() - created_at)
+            if delta > CREATED_AT_TOLERANCE_S:
+                text += self.tr("  (differs from header: {header})").format(
+                    header=self._utc_stamp(created_at)
+                )
+        return text
+
+    @staticmethod
+    def _utc_stamp(seconds: int) -> str:
+        moment = datetime.datetime.fromtimestamp(seconds, datetime.timezone.utc)
+        return moment.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    def _session_header(self, session: sessions.Session) -> str:
+        return self.tr("{id}\n{created}\ncwd: {cwd}\nmodel: {model}\n{count} rule(s)").format(
+            id=self._id_line(session.session_id),
+            created=self._created_line(session.session_id, session.created_at),
+            cwd=session.cwd,
+            model=session.model,
+            count=len(session.rules),
+        )
 
     def commit(self) -> None:
         """Park the shown session's editor content in its model.
@@ -337,20 +431,28 @@ class SessionsTab(QWidget):
     def _add_group(self) -> None:
         if self._current is None:
             return
-        name, ok = QInputDialog.getText(self, "Add tool group", "Tool name (e.g. bash):")
+        name, ok = QInputDialog.getText(
+            self, self.tr("Add tool group"), self.tr("Tool name (e.g. bash):")
+        )
         name = name.strip()
         if not ok or not name:
             return
         if not TOOL_NAME_RE.match(name):
             QMessageBox.warning(
                 self,
-                "Cannot add group",
-                "Names must start with a letter, digit or underscore and contain "
-                "only letters, digits, underscores and hyphens.",
+                self.tr("Cannot add group"),
+                self.tr(
+                    "Names must start with a letter, digit or underscore and contain "
+                    "only letters, digits, underscores and hyphens."
+                ),
             )
             return
         if any(tool == name for tool, _ in self._editors):
-            QMessageBox.warning(self, "Cannot add group", f"A group named '{name}' already exists.")
+            QMessageBox.warning(
+                self,
+                self.tr("Cannot add group"),
+                self.tr("A group named '{name}' already exists.").format(name=name),
+            )
             return
         editor = ScopeRulesEditor(self._on_rules_changed)
         editor.add_row("", EFFECT_ALLOW)
@@ -372,19 +474,19 @@ class SessionsTab(QWidget):
 class FolderDialog(QDialog):
     def __init__(self, parent, kind="trusted", path="", files=None):
         super().__init__(parent)
-        self.setWindowTitle("Edit Folder Trust")
+        self.setWindowTitle(self.tr("Edit Folder Trust"))
         layout = QFormLayout(self)
         self.path_input = QLineEdit(path)
-        layout.addRow("Path:", self.path_input)
+        layout.addRow(self.tr("Path:"), self.path_input)
         self.files_input = QLineEdit(", ".join(files) if files else "")
-        layout.addRow("Gated files (comma-separated):", self.files_input)
-        self.trusted_radio = QRadioButton("Trusted")
-        self.rejected_radio = QRadioButton("Rejected")
+        layout.addRow(self.tr("Gated files (comma-separated):"), self.files_input)
+        self.trusted_radio = QRadioButton(self.tr("Trusted"))
+        self.rejected_radio = QRadioButton(self.tr("Rejected"))
         if kind == "trusted":
             self.trusted_radio.setChecked(True)
         else:
             self.rejected_radio.setChecked(True)
-        layout.addRow("Type:", self.trusted_radio)
+        layout.addRow(self.tr("Type:"), self.trusted_radio)
         layout.addRow("", self.rejected_radio)
         button_box = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -408,25 +510,27 @@ class FoldersTab(QWidget):
         self._pre_trust = None
         self._on_change = on_change or (lambda: None)
         layout = QVBoxLayout(self)
-        self.file_label = QLabel("file: (none)")
+        self.file_label = QLabel(self.tr("file: (none)"))
         self.file_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.file_label.setStyleSheet("font-family: monospace; color: #888;")
         self.file_label.setWordWrap(True)
         layout.addWidget(self.file_label)
         layout.addWidget(
             QLabel(
-                "Folder trust. Add, edit or remove a trusted folder or a rejected "
-                "path; changes are written on Save."
+                self.tr(
+                    "Folder trust. Add, edit or remove a trusted folder or a rejected "
+                    "path; changes are written on Save."
+                )
             )
         )
         self.list = QListWidget()
         self.list.itemDoubleClicked.connect(self._edit_item)
         layout.addWidget(self.list)
         buttons = QHBoxLayout()
-        add_btn = QPushButton("+ Add folder")
+        add_btn = QPushButton(self.tr("+ Add folder"))
         add_btn.clicked.connect(self._show_add_dialog)
         buttons.addWidget(add_btn)
-        remove = QPushButton("Remove selected")
+        remove = QPushButton(self.tr("Remove selected"))
         remove.clicked.connect(self._remove)
         buttons.addWidget(remove)
         buttons.addStretch(1)
@@ -440,26 +544,28 @@ class FoldersTab(QWidget):
         maki reads it once at startup to grandfather roots, so editing it here
         is the only way to fix a snapshot that was frozen wrongly.
         """
-        group = QGroupBox("Pre-trust roots (frozen snapshot)")
+        group = QGroupBox(self.tr("Pre-trust roots (frozen snapshot)"))
         box = QVBoxLayout(group)
-        self.pre_trust_label = QLabel("file: (none)")
+        self.pre_trust_label = QLabel(self.tr("file: (none)"))
         self.pre_trust_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.pre_trust_label.setStyleSheet("font-family: monospace; color: #888;")
         self.pre_trust_label.setWordWrap(True)
         box.addWidget(self.pre_trust_label)
         box.addWidget(
             QLabel(
-                "Project roots that predate folder trust and are grandfathered at "
-                "startup. Add or remove paths; changes are written on Save."
+                self.tr(
+                    "Project roots that predate folder trust and are grandfathered at "
+                    "startup. Add or remove paths; changes are written on Save."
+                )
             )
         )
         self.pre_trust_list = QListWidget()
         box.addWidget(self.pre_trust_list)
         row = QHBoxLayout()
-        add = QPushButton("+ Add root")
+        add = QPushButton(self.tr("+ Add root"))
         add.clicked.connect(self._add_pre_trust_root)
         row.addWidget(add)
-        remove = QPushButton("Remove selected")
+        remove = QPushButton(self.tr("Remove selected"))
         remove.clicked.connect(self._remove_pre_trust_root)
         row.addWidget(remove)
         row.addStretch(1)
@@ -469,16 +575,20 @@ class FoldersTab(QWidget):
     def load(self, doc, pre_trust=None) -> None:
         self._doc = doc
         if doc is not None:
-            state = "exists" if doc.exists else "will be created on save"
-            self.file_label.setText(f"file: {doc.path}\n({state})")
+            state = self.tr("exists") if doc.exists else self.tr("will be created on save")
+            self.file_label.setText(
+                self.tr("file: {path}\n({state})").format(path=doc.path, state=state)
+            )
         else:
-            self.file_label.setText("file: (none)")
+            self.file_label.setText(self.tr("file: (none)"))
         self._pre_trust = pre_trust
         if pre_trust is not None:
-            state = "exists" if pre_trust.exists else "will be created on save"
-            self.pre_trust_label.setText(f"file: {pre_trust.path}\n({state})")
+            state = self.tr("exists") if pre_trust.exists else self.tr("will be created on save")
+            self.pre_trust_label.setText(
+                self.tr("file: {path}\n({state})").format(path=pre_trust.path, state=state)
+            )
         else:
-            self.pre_trust_label.setText("file: (none)")
+            self.pre_trust_label.setText(self.tr("file: (none)"))
         self._refresh()
 
     def _refresh(self) -> None:
@@ -486,13 +596,16 @@ class FoldersTab(QWidget):
         self.pre_trust_list.clear()
         if self._doc is not None:
             for entry in self._doc.folders:
+                files = ", ".join(entry.files) or self.tr("none")
                 item = QListWidgetItem(
-                    f"[trusted] {entry.path}\n  gated files: {', '.join(entry.files) or 'none'}"
+                    self.tr("[trusted] {path}\n  gated files: {files}").format(
+                        path=entry.path, files=files
+                    )
                 )
                 item.setData(Qt.ItemDataRole.UserRole, ("trusted", entry.path))
                 self.list.addItem(item)
             for path in self._doc.rejected:
-                item = QListWidgetItem(f"[rejected] {path}")
+                item = QListWidgetItem(self.tr("[rejected] {path}").format(path=path))
                 item.setData(Qt.ItemDataRole.UserRole, ("rejected", path))
                 self.list.addItem(item)
         if self._pre_trust is not None:
@@ -502,11 +615,15 @@ class FoldersTab(QWidget):
     def _add_pre_trust_root(self) -> None:
         if self._pre_trust is None:
             return
-        directory = QFileDialog.getExistingDirectory(self, "Add pre-trust root")
+        directory = QFileDialog.getExistingDirectory(self, self.tr("Add pre-trust root"))
         if not directory:
             return
         if not self._pre_trust.add(directory):
-            QMessageBox.information(self, "Already present", f"{directory} is already listed.")
+            QMessageBox.information(
+                self,
+                self.tr("Already present"),
+                self.tr("{path} is already listed.").format(path=directory),
+            )
             return
         self._refresh()
         self._on_change()
@@ -580,12 +697,17 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("maki trust editor")
         self.resize(1100, 760)
 
-        self._last_project_row = -1
+        # The project row whose file the editor currently shows. Distinct from
+        # projects_selector.currentRow(), which is already the *incoming* row by
+        # the time currentRowChanged fires, so committing to currentRow() would
+        # write the visible editor into the wrong project.
+        self._shown_project_row = -1
         self._active_tab = SESSIONS_TAB
         self._loading = False
         self._baseline: dict = {}
         self._maki_cache = None
         self._maki_checked_at = 0.0
+        self._maki_cache_prev: bool | None = None
         self._force_close = False
         self.workspace = workspace.load_workspace()
         self.add_tool_btn = None
@@ -600,8 +722,10 @@ class MainWindow(QMainWindow):
 
         self.tabs = QTabWidget()
         self.sessions_tab = SessionsTab(self._mark_dirty, self._mark_dirty, self._session_row_dirty)
-        self.global_tab = PermissionsTab("No global permissions file yet.", self._mark_dirty)
-        self.projects_tab = PermissionsTab("Select a project.", self._mark_dirty)
+        self.global_tab = PermissionsTab(
+            self.tr("No global permissions file yet."), self._mark_dirty
+        )
+        self.projects_tab = PermissionsTab(self.tr("Select a project."), self._mark_dirty)
         self.folders_tab = FoldersTab(self._mark_dirty)
 
         # The projects tab pairs a selector with the permissions editor.
@@ -613,21 +737,21 @@ class MainWindow(QMainWindow):
         pc_layout.addWidget(self.projects_selector)
         pc_layout.addWidget(self.projects_tab, 1)
 
-        self.tabs.addTab(self.sessions_tab, "Sessions")
-        self.tabs.addTab(projects_container, "Projects")
-        self.tabs.addTab(self.folders_tab, "Folders")
-        self.tabs.addTab(self.global_tab, "Global")
+        self.tabs.addTab(self.sessions_tab, self._tab_title(SESSIONS_TAB))
+        self.tabs.addTab(projects_container, self._tab_title(PROJECTS_TAB))
+        self.tabs.addTab(self.folders_tab, self._tab_title(FOLDERS_TAB))
+        self.tabs.addTab(self.global_tab, self._tab_title(GLOBAL_TAB))
         self.tabs.currentChanged.connect(self._tab_changed)
         layout.addWidget(self.tabs)
 
         bar = QHBoxLayout()
-        save = QPushButton("Save")
+        save = QPushButton(self.tr("Save"))
         save.clicked.connect(self._save)
-        reload_btn = QPushButton("Reload")
+        reload_btn = QPushButton(self.tr("Reload"))
         reload_btn.clicked.connect(self._reload)
-        self.add_tool_btn = QPushButton("+ Tool section (project)")
+        self.add_tool_btn = QPushButton(self.tr("+ Tool section (project)"))
         self.add_tool_btn.clicked.connect(self._add_project_tool)
-        self.add_mcp_btn = QPushButton("+ MCP server (project)")
+        self.add_mcp_btn = QPushButton(self.tr("+ MCP server (project)"))
         self.add_mcp_btn.clicked.connect(self._add_project_mcp)
         bar.addWidget(reload_btn)
         bar.addWidget(self.add_tool_btn)
@@ -640,9 +764,37 @@ class MainWindow(QMainWindow):
         self._setup_shortcuts()
         self._populate()
 
+        # maki opening or closing a session is invisible to this process unless
+        # we look. The tick re-probes the visible rows and the process state; a
+        # focus change refreshes at once, so returning to the window is current
+        # rather than up to one interval stale.
+        self._liveness_timer = QTimer(self)
+        self._liveness_timer.setInterval(LIVENESS_POLL_MS)
+        self._liveness_timer.timeout.connect(self._refresh_liveness)
+        self._liveness_timer.start()
+
     def _setup_shortcuts(self) -> None:
         QShortcut(QKeySequence("Ctrl+S"), self, activated=self._save)
         QShortcut(QKeySequence("Ctrl+R"), self, activated=self._reload)
+
+    def changeEvent(self, event) -> None:
+        if event.type() == event.Type.ActivationChange and self.isActiveWindow():
+            self._refresh_liveness()
+        super().changeEvent(event)
+
+    def _tab_title(self, index: int) -> str:
+        """The display title for a tab, as a ``tr`` literal so it extracts.
+
+        ``TAB_TITLES`` stays the stable English tuple used for indexing; this
+        maps an index back to a translatable literal for the actual tab text.
+        """
+        if index == SESSIONS_TAB:
+            return self.tr("Sessions")
+        if index == PROJECTS_TAB:
+            return self.tr("Projects")
+        if index == FOLDERS_TAB:
+            return self.tr("Folders")
+        return self.tr("Global")
 
     def _populate(self) -> None:
         app = QApplication.instance()
@@ -665,7 +817,7 @@ class MainWindow(QMainWindow):
             if self.workspace.projects:
                 self.projects_selector.setCurrentRow(0)
             self._refresh_marks()
-            self._update_status("Loaded. Edit, then Save. Backups are kept automatically.")
+            self._update_status(self.tr("Loaded. Edit, then Save. Backups are kept automatically."))
         finally:
             app.restoreOverrideCursor()
         self._log_startup()
@@ -692,9 +844,11 @@ class MainWindow(QMainWindow):
         detail = "\n\n".join(f"{problem.path}\n  {problem.reason}" for problem in problems)
         QMessageBox.warning(
             self,
-            "Some files could not be read",
-            "These files are malformed and were opened as empty; fix them or "
-            f"close maki before editing:\n\n{detail}",
+            self.tr("Some files could not be read"),
+            self.tr(
+                "These files are malformed and were opened as empty; fix them or "
+                "close maki before editing:\n\n{detail}"
+            ).format(detail=detail),
         )
 
     def _capture_baselines(self) -> None:
@@ -753,7 +907,7 @@ class MainWindow(QMainWindow):
             return
         self._commit_current()
         self._refresh_marks()
-        self._update_status("Unsaved changes.")
+        self._update_status(self.tr("Unsaved changes."))
 
     def _dirty(self) -> bool:
         """Whether the visible editors differ from what was loaded.
@@ -772,10 +926,10 @@ class MainWindow(QMainWindow):
         """
         if index == SESSIONS_TAB:
             self.sessions_tab.commit()
-        elif index == PROJECTS_TAB and self.projects_selector.currentRow() >= 0:
+        elif index == PROJECTS_TAB and self._shown_project_row >= 0:
             file = self.projects_tab.collect()
             if file is not None:
-                self.workspace.projects[self.projects_selector.currentRow()].permissions_file = file
+                self.workspace.projects[self._shown_project_row].permissions_file = file
 
     def _commit_current(self) -> None:
         self._commit_tab(self.tabs.currentIndex())
@@ -786,8 +940,8 @@ class MainWindow(QMainWindow):
             return
         answer = QMessageBox.question(
             self,
-            "Unsaved changes",
-            "You have unsaved changes. Close without saving?",
+            self.tr("Unsaved changes"),
+            self.tr("You have unsaved changes. Close without saving?"),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Cancel,
         )
@@ -797,8 +951,27 @@ class MainWindow(QMainWindow):
             event.ignore()
 
     def _reload(self) -> None:
+        if not self._confirm_discard():
+            return
         self.workspace = workspace.load_workspace()
         self._populate()
+
+    def _confirm_discard(self) -> bool:
+        """Ask before an action that drops unsaved edits; True to proceed.
+
+        Reload re-reads every store, so any edit not yet saved is gone. Close
+        already guards this; Reload must too, or a stray Ctrl+R loses work.
+        """
+        if not self._dirty():
+            return True
+        answer = QMessageBox.question(
+            self,
+            self.tr("Unsaved changes"),
+            self.tr("You have unsaved changes. Reload and discard them?"),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        return answer == QMessageBox.StandardButton.Yes
 
     def _tab_changed(self, index: int) -> None:
         """Refresh tab titles and re-read the global file when it comes into view.
@@ -823,10 +996,13 @@ class MainWindow(QMainWindow):
         except (OSError, ValueError):
             return
         self.global_tab.load(self.workspace.global_permissions)
-        self._capture_baselines()
+        # Advance only the global file's baseline. A full recapture would reset
+        # every other store's baseline to its (edited) model, silently clearing
+        # their dirty marks and losing those edits on save.
+        self._baseline[path] = self.workspace.global_permissions.to_toml()
 
     def _project_selected(self, row: int) -> None:
-        if row != self._last_project_row and self._last_project_row >= 0:
+        if row != self._shown_project_row and self._shown_project_row >= 0:
             self._commit_tab(PROJECTS_TAB)
             self._refresh_marks()
         if row < 0 or row >= len(self.workspace.projects):
@@ -835,27 +1011,35 @@ class MainWindow(QMainWindow):
             self.add_mcp_btn.setEnabled(False)
             return
         view = self.workspace.projects[row]
-        view.reload()
+        # Re-read a project file so a change maki made mid-run shows — but only
+        # when the incoming project has no pending edit. Reloading a dirty row
+        # would discard the edit (as _populate_row already avoids for sessions).
+        if row not in self._project_targets():
+            view.reload()
         self.projects_tab.load(view.permissions_file)
-        self._last_project_row = row
+        self._shown_project_row = row
         self.add_tool_btn.setEnabled(True)
         self.add_mcp_btn.setEnabled(True)
 
     def _add_project_tool(self) -> None:
-        name, ok = QInputDialog.getText(self, "Add tool section", "Tool name (e.g. write):")
+        name, ok = QInputDialog.getText(
+            self, self.tr("Add tool section"), self.tr("Tool name (e.g. write):")
+        )
         if not ok or not name.strip():
             return
         error = self.projects_tab.add_tool_section(name.strip())
         if error:
-            QMessageBox.warning(self, "Cannot add section", error)
+            QMessageBox.warning(self, self.tr("Cannot add section"), error)
 
     def _add_project_mcp(self) -> None:
-        name, ok = QInputDialog.getText(self, "Add MCP server", "Server name (e.g. github):")
+        name, ok = QInputDialog.getText(
+            self, self.tr("Add MCP server"), self.tr("Server name (e.g. github):")
+        )
         if not ok or not name.strip():
             return
         error = self.projects_tab.add_mcp_section(name.strip())
         if error:
-            QMessageBox.warning(self, "Cannot add section", error)
+            QMessageBox.warning(self, self.tr("Cannot add section"), error)
 
     def _session_row_dirty(self, row: int) -> bool:
         return row in self._session_targets()
@@ -1005,8 +1189,117 @@ class MainWindow(QMainWindow):
             mark = DIRTY_MARK if row in dirty_projects else ""
             item.setText(self._project_labels[row] + mark)
         dirty_tabs = {index for index, _ in self._changed_stores()}
-        for index, title in enumerate(TAB_TITLES):
-            self.tabs.setTabText(index, title + (DIRTY_MARK if index in dirty_tabs else ""))
+        for index in range(len(TAB_TITLES)):
+            mark = DIRTY_MARK if index in dirty_tabs else ""
+            self.tabs.setTabText(index, self._tab_title(index) + mark)
+
+    def _refresh_liveness(self) -> None:
+        """Re-probe maki and the visible sessions, then reflect any change.
+
+        A lock can appear (maki opens a session we are viewing) or vanish (maki
+        exits) with nothing here touched, so the view would lie until Save. This
+        is the only periodic work; it is idle-safe (a non-blocking lock probe and
+        a brief process scan) and driven by the poll timer and window focus.
+        """
+        self._maki_cache = None
+        previous = self._maki_cache_prev
+        self._maki_cache_prev = self._maki_status().running
+        locked_rows = self._probe_visible_locks()
+        if locked_rows:
+            self._apply_lock_changes(locked_rows)
+        if previous is not None and previous != self._maki_cache_prev:
+            state = self.tr("maki started") if self._maki_cache_prev else self.tr("maki exited")
+            self._update_status(state)
+        self._refresh_marks()
+
+    def _probe_visible_locks(self) -> set[int]:
+        """Rows whose live lock state differs from the cached view.
+
+        Scoped to the visible rows only: the active row is always re-probed (it
+        is what the user is editing), and the rest is whatever is on screen.
+        Probing all sessions would touch every lock file each tick for rows the
+        user cannot see; those are caught when they scroll into view, because
+        selecting a row re-probes it.
+        """
+        sessions_dir = paths.sessions_dir()
+        changed: set[int] = set()
+        for row in self._visible_session_rows():
+            view = self.workspace.sessions[row]
+            locked = sessions.is_locked(sessions_dir, view.session.session_id)
+            if locked != view.locked:
+                changed.add(row)
+        return changed
+
+    def _visible_session_rows(self) -> list[int]:
+        """The active session row plus every row in the viewport.
+
+        No scroll hook: an off-screen lock is caught when its row is selected,
+        which re-probes it, so the cheap viewport range is enough and no
+        scrollbar signal is needed.
+        """
+        if not self.workspace.sessions:
+            return []
+        row = self.sessions_tab.list.currentRow()
+        if row < 0:
+            row = self.sessions_tab._shown
+        rows = {row} if row >= 0 else set()
+        count = self.sessions_tab.list.count()
+        for screen_row in range(count):
+            item = self.sessions_tab.list.item(screen_row)
+            if (
+                self.sessions_tab.list.viewport()
+                .rect()
+                .intersects(self.sessions_tab.list.visualItemRect(item))
+            ):
+                rows.add(screen_row)
+        return sorted(rows)
+
+    def _apply_lock_changes(self, rows: set[int]) -> None:
+        """Flip the changed rows' lock state and reflect it in the view.
+
+        A row that just became locked is shown read-only and its ``+ Add`` is
+        disabled, matching a session that was already open when it loaded; its
+        content is refreshed from disk first, unless it holds an unsaved edit.
+        An edit is left alone (reloading would drop it): it is parked, marked,
+        and simply stops being a save target. The active row's editor is
+        re-populated so the change is visible at once.
+        """
+        sessions_dir = paths.sessions_dir()
+        shown = self.sessions_tab._shown
+        parked: set[int] = set()
+        for row in rows:
+            view = self.workspace.sessions[row]
+            now_locked = sessions.is_locked(sessions_dir, view.session.session_id)
+            dirty = self._session_row_dirty(row)
+            if now_locked and dirty:
+                self._park_on_lock(row)
+                parked.add(row)
+            elif not dirty and row != shown:
+                view.reload()
+            view.locked = now_locked
+        if shown in rows and shown not in parked:
+            self.sessions_tab._populate_row(shown)
+        elif shown in parked:
+            # Re-populating a parked row would reload it: the lock excludes it
+            # from the dirty set, so _populate_row's guard reads it as clean and
+            # re-reads the file, dropping the edit. Flip the editor in place.
+            self.sessions_tab.set_read_only(True)
+        self.sessions_tab.sync_labels()
+
+    def _park_on_lock(self, row: int) -> None:
+        """Report a dirty row that just became locked, keeping the edit.
+
+        The edit is not discarded: it stays in the model and is dropped from the
+        save targets, so it is lost only if the user reloads. The status line
+        says so with the warning prefix.
+        """
+        label = self.workspace.sessions[row].session.session_id
+        LOGGER.warning("session locked with unsaved changes: %s", label)
+        self._update_status(
+            self.tr("Session {id} is now open in maki; unsaved changes are parked.").format(
+                id=label
+            )
+        )
 
     def _drop_locked_sessions(
         self, targets: list[safe_write.WriteTarget]
@@ -1029,9 +1322,11 @@ class MainWindow(QMainWindow):
         names = "\n".join(f"  · {t.path.stem}" for t in locked)
         QMessageBox.information(
             self,
-            "Session is open in maki",
-            f"These sessions are open in maki and were not saved:\n{names}\n\n"
-            "Close the session in maki, then save again.",
+            self.tr("Session is open in maki"),
+            self.tr(
+                "These sessions are open in maki and were not saved:\n{names}\n\n"
+                "Close the session in maki, then save again."
+            ).format(names=names),
         )
         locked_paths = {t.path for t in locked}
         return [t for t in targets if t.path not in locked_paths]
@@ -1039,32 +1334,32 @@ class MainWindow(QMainWindow):
     def _save(self) -> None:
         targets = self._current_targets()
         if not targets:
-            self._update_status("Nothing to save in this view.")
+            self._update_status(self.tr("Nothing to save in this view."))
             return
 
         LOGGER.info("save: %d target(s)", len(targets))
         targets = self._drop_locked_sessions(targets)
         if not targets:
             LOGGER.info("save: nothing left, target open in maki")
-            self._update_status("Nothing saved: file is open in maki.")
+            self._update_status(self.tr("Nothing saved: file is open in maki."))
             return
 
         status = safe_write.detect_maki()
         if status.running:
             blocked = safe_write.blocked_targets(targets, status)
-            names = "\n".join(f"  · {t.path}" for t in blocked) or (
+            names = "\n".join(f"  · {t.path}" for t in blocked) or self.tr(
                 "  (none — only session writes pending)"
             )
-            detail = (
-                f"maki is running (pid {', '.join(str(p) for p in status.pids)}).\n\n"
-                f"Shared files that must wait until maki closes:\n{names}\n\n"
+            detail = self.tr(
+                "maki is running (pid {pids}).\n\n"
+                "Shared files that must wait until maki closes:\n{names}\n\n"
                 "Session files are not held open by maki, so they can be written now, "
                 "but a running session of the same file may re-append on exit.\n\n"
                 "Write the session files only and skip the shared ones?"
-            )
+            ).format(pids=", ".join(str(p) for p in status.pids), names=names)
             choice = QMessageBox.question(
                 self,
-                "maki is running",
+                self.tr("maki is running"),
                 detail,
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
                 QMessageBox.StandardButton.Cancel,
@@ -1075,15 +1370,15 @@ class MainWindow(QMainWindow):
                 blocked_paths = {t.path for t in blocked}
                 targets = [t for t in targets if t.path not in blocked_paths]
             if not targets:
-                self._update_status("No writable targets; close maki and retry.")
+                self._update_status(self.tr("No writable targets; close maki and retry."))
                 return
 
         saved = {t.path for t in targets}
         try:
-            result = safe_write.save_all(targets)
+            result = safe_write.write_targets(targets)
         except OSError as exc:
             LOGGER.error("save failed: %s", exc)
-            QMessageBox.critical(self, "Save failed", str(exc))
+            QMessageBox.critical(self, self.tr("Save failed"), str(exc))
             return
         LOGGER.info("save ok: %s", result.describe())
         # Only the saved files' baselines move: reloading the whole workspace

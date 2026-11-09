@@ -222,7 +222,7 @@ def test_no_edits_switches_projects_without_prompt(app, tmp_path, monkeypatch) -
 
     window.projects_selector.setCurrentRow(0)
 
-    assert window._last_project_row == 0
+    assert window._shown_project_row == 0
 
 
 MALFORMED_CASES = {

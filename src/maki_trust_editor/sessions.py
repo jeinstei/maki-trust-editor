@@ -23,10 +23,12 @@ Session rule effects are only ``allow`` or ``deny``; ``prompt`` belongs to
 
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import shutil
 import sys
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -50,6 +52,13 @@ TAIL_START = 64 * 1024
 NEWLINE = b"\n"
 _COPY_CHUNK = 1024 * 1024
 
+# maki's session ids are a UUID (16 bytes) displayed base58 (maki-storage's
+# ``MakiId``). A UUIDv7 embeds a 48-bit Unix-millisecond timestamp; a legacy v4
+# does not, which is why a decoded v4 has no creation time.
+_BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+_UUID_BYTES = 16
+_MILLIS = 1000
+
 # A running maki holds an advisory kernel lock (maki-storage's ``Lock``) on an
 # empty ``sessions/locks/<session-id>`` file. The file is never deleted, so only
 # an actual held lock means the session is open: taking a shared lock non-
@@ -69,6 +78,56 @@ class SessionRule:
             payload[SCOPE_KEY] = self.scope
         payload[EFFECT_KEY] = self.effect
         return payload
+
+
+@dataclass(frozen=True)
+class DecodedId:
+    """A session id taken apart for display.
+
+    ``uuid`` is the canonical hyphenated form and ``version`` the UUID version
+    (7 for ids maki writes today, 4 for legacy ones). ``created`` is the
+    timestamp the id itself encodes, in UTC, or ``None`` for a legacy id that
+    carries none. ``None`` throughout means the id did not parse at all.
+    """
+
+    uuid: str
+    version: int | None
+    created: datetime.datetime | None
+
+
+def _decode_base58(text: str) -> bytes | None:
+    number = 0
+    for char in text:
+        index = _BASE58_ALPHABET.find(char)
+        if index < 0:
+            return None
+        number = number * len(_BASE58_ALPHABET) + index
+    body = number.to_bytes((number.bit_length() + 7) // 8, "big")
+    return b"\x00" * (len(text) - len(text.lstrip(_BASE58_ALPHABET[0]))) + body
+
+
+def decode_session_id(session_id: str) -> DecodedId | None:
+    """Take a session id apart for display, or ``None`` if it does not parse.
+
+    Mirrors ``MakiId``: a hyphenated or bare-hex UUID first, then base58. A v7
+    id yields the millisecond timestamp baked into its first 48 bits; a v4 has
+    none (it is random), so ``created`` is ``None``.
+    """
+    raw = None
+    try:
+        raw = uuid.UUID(session_id).bytes
+    except (ValueError, AttributeError):
+        candidate = _decode_base58(session_id)
+        if candidate is not None and len(candidate) == _UUID_BYTES:
+            raw = candidate
+    if raw is None:
+        return None
+    parsed = uuid.UUID(bytes=raw)
+    created = None
+    if parsed.version == 7:
+        millis = int.from_bytes(raw[:6], "big")
+        created = datetime.datetime.fromtimestamp(millis / _MILLIS, datetime.timezone.utc)
+    return DecodedId(uuid=str(parsed), version=parsed.version, created=created)
 
 
 @dataclass

@@ -20,7 +20,7 @@ import sys
 from qtpy.QtCore import QTimer
 from qtpy.QtWidgets import QApplication
 
-from . import paths
+from . import i18n, paths
 from .window import MainWindow
 
 HEARTBEAT_MS = 200
@@ -118,6 +118,10 @@ def main() -> int:
     setup_logging()
     app = QApplication(sys.argv)
     app.setApplicationName("maki trust editor")
+    # Install translators before any widget is built: a widget captures its text
+    # when constructed, so a translator installed afterwards would miss it.
+    translators = i18n.install(app)
+    LOGGER.info("i18n: %d translator(s) installed", len(translators))
     window = MainWindow()
     interrupt = InterruptController(app)
     interrupt.install(close_target=window)

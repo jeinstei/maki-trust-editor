@@ -46,6 +46,10 @@ uv sync --extra pyside6      # or --extra pyqt6
 uv run maki-trust-editor
 ```
 
+`psutil` is an optional extra (`--extra psutil`). With it, the app detects a
+running maki through one cross-platform API; without it, it falls back to the
+native `pgrep` (Unix) or `tasklist` (Windows).
+
 The app is built on [QtPy](https://github.com/spyder-ide/qtpy), so it runs
 against whichever Qt binding you have; nothing in the source picks one for you.
 Set `QT_API` to force a specific binding.
@@ -55,7 +59,9 @@ Set `QT_API` to force a specific binding.
 There are four tabs along the top and a **Save** button at the bottom:
 
 - **Sessions** — every maki session, newest first. Pick one to see and edit its
-  rules.
+  rules. The panel above the rules shows the session's id with the UUID it
+  encodes and the creation time read out of that id, so you can tell when a
+  session was made even before maki records anything.
 - **Projects** — every project maki has seen (found from session working
   directories). Pick one to edit its `.maki/permissions.toml`.
 - **Folders** — the folder-trust list and the pre-trust snapshot.
@@ -80,6 +86,10 @@ In **Sessions**, add a tool group with **+ Add tool group**. In **Projects** and
 **Global**, add sections with **+ Tool section** and **+ MCP server**; tool and
 server names may contain letters, digits, underscores and hyphens, and must start
 with a letter, digit or underscore — duplicates are rejected.
+
+When a project or global file is empty (or does not exist yet) the rules area
+shows a hint pointing at those add buttons, so you can start straight away — you
+do not need to save an empty file first.
 
 **Finding things:** to the right of a section heading is a **Section** picker
 that narrows the view to one tool, and a collapsible **Filter** box (the
@@ -114,7 +124,8 @@ against both:
 - **Backups.** Before writing, the previous file is copied to `<name>.bak` beside
   it (one backup per file, replaced on each save).
 - **Atomic writes.** Changes go to a temporary file and are renamed into place,
-  so a crash never leaves a half-written file.
+  so a crash never leaves a half-written file. A symlinked target is followed to
+  the real file, so a dotfile-managed link is never replaced by a regular file.
 - **A "maki is running" guard.** The app looks for a running `maki` process and
   refuses to silently overwrite:
   - **Shared** files (project/global `permissions.toml` and the folder-trust
@@ -134,6 +145,13 @@ lock files behind, so only a lock that is *currently held* counts as open.
 An open session is also **never marked as having unsaved changes**, even though
 maki keeps appending to its file while you look at it. Since nothing on that
 screen can be edited or saved, the ` *` marker would be meaningless there.
+
+The lock state is **refreshed while the app runs**: a background check (every two
+seconds, and whenever the window regains focus) notices a session maki opens or
+closes without a reload, flipping the row read-only or editable on the spot. If
+maki opens a session you have already edited, your edit is kept but *parked* —
+the row stops being writable and the status line tells you so; only reloading
+discards it.
 
 ## Good to know
 
@@ -156,6 +174,17 @@ screen can be edited or saved, the ` *` marker would be meaningless there.
   in `permissions.toml`.
 - **Ctrl-C** asks the window to close and honours the unsaved-changes prompt.
   Pressing Ctrl-C a second time while the prompt is open closes immediately.
+
+## Languages
+
+The app's own text is written in English and is set up to be translated. If a
+translation is installed for your language, the app uses it automatically based
+on your system locale; otherwise it simply stays English. (Qt's own built-in
+buttons, like **OK** and **Cancel**, are translated by Qt itself.)
+
+To force a language, set the `MAKI_TRUST_EDITOR_LANG` environment variable, for
+example `MAKI_TRUST_EDITOR_LANG=de_DE`. An unknown value is ignored and the
+system locale is used.
 
 ## Closing with unsaved changes
 
