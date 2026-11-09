@@ -131,6 +131,10 @@ shows its rules **read-only** — you can look, but not change them, and they ar
 never saved, because maki would overwrite your change anyway. maki leaves these
 lock files behind, so only a lock that is *currently held* counts as open.
 
+An open session is also **never marked as having unsaved changes**, even though
+maki keeps appending to its file while you look at it. Since nothing on that
+screen can be edited or saved, the ` *` marker would be meaningless there.
+
 ## Good to know
 
 - **Session defaults.** If a session or section has a `default` maki would reject

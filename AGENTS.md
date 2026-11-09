@@ -13,15 +13,35 @@ concrete binding. Python is managed with `uv`; formatting is `black`, linting is
 
 ## Code guidelines
 
-Same spirit as the repo root `AGENTS.md`:
+**Write code in the style of the repo root `maki/AGENTS.md`.** That file is the
+source of truth for how we write code; this section is its Python translation.
+When the two disagree, the root file wins. Read it before editing.
 
-- KISS, DRY, SRP. Every line must justify its existence.
-- No trivial comments; comments explain *why*, not *what*.
-- No wildcard imports; import names at the top and use them short.
-- Constants at the top of the file.
-- No inline magic numbers/strings; name them.
-- Descriptive names.
-- Prefer editing existing files; keep the README consistent with behaviour.
+From the root, applied here:
+
+- No trivial comments. Every comment explains *why*, not *what*.
+- Minimal bloat (KISS, DRY, SRP). No unnecessary state; every line must justify
+  its existence.
+- No wildcard imports; import names at the top and use the short name everywhere
+  (`from pathlib import Path`, then `Path`, never `pathlib.Path(...)` inline).
+- Constants at the top of the file, right after imports.
+- Descriptive names for variables and functions.
+- No inline magic numbers or strings; name them (module constant or an
+  `Enum`/`Literal` alias).
+- Explicit error handling over silent failure; raise a typed exception for
+  domain errors instead of a bare `Exception`, and give a helpful message.
+- Prefer structured, wide logging with useful fields over a single string.
+- Tests: snake_case names, one behaviour per test, no tautologies or flaky
+  timing; in tests assert against the shared constant rather than a copied
+  literal. See `## Testing` below.
+
+Python specifics (the analogue of the root's Rust idioms):
+
+- Format with `black`, lint with `ruff`; both must be clean.
+- Type-annotate public functions; `from __future__ import annotations` at the top.
+- Prefer `dataclasses` for plain records; prefer `pathlib.Path` over raw strings.
+- Cross-platform: never assume POSIX or Windows-only behaviour.
+- Prefer editing existing files; keep `README.md` consistent with behaviour.
 - **Ask the user before any functional change** (standing rule).
 
 ## Testing
@@ -30,7 +50,36 @@ Same spirit as the repo root `AGENTS.md`:
   **timeout**. A `QMessageBox` modal under the `minimal` platform hangs forever;
   any test that can trigger a dialog must stub it or guarantee it does not fire.
 - `ruff check src tests` and `black --check src tests` must be clean.
-- 84 tests as of last change. Keep them fast (whole suite < 1 s).
+- 89 tests as of last change. Keep them fast (whole suite well under a couple of
+  seconds).
+
+### Verification pipeline
+
+A green suite is the *floor*, not the proof. Before believing a change is done,
+run all of these:
+
+1. **Green suite + lint.** `pytest`, `ruff check src tests`,
+   `black --check src tests`. All clean.
+2. **Mutation check every new or changed assertion.** Temporarily break the
+   exact branch the test claims to cover (flip the condition, drop the guard,
+   return the wrong value) and confirm the test **fails**. Then restore. A test
+   that still passes under the mutation is vacuous — rewrite or delete it. Two
+   tests in this project passed while their target was fully broken until this
+   step caught them.
+3. **Exercise the real path, not a mock-only path.** When the bug involves a
+   file changing under us, drive the real store: a **background thread/process
+   that keeps appending** to a live session while the window reacts, asserting
+   the invariant on each iteration. Prefer the actual running session on this
+   machine over a synthetic copy when one exists.
+4. **Check the negative case too.** If a test proves "X is blocked", also prove
+   the near-miss is *not* blocked, so a stub that blocks everything cannot pass
+   (e.g. block only an in-use file, not all shared files).
+5. **Timeouts everywhere.** Any run that can reach a Qt dialog or wait on I/O
+   goes through `timeout`. Never `sleep`-and-poll in a test; make the assertion
+   deterministic instead.
+
+Keep scratch repros inside the project dir and delete them when done — `/tmp` is
+sometimes unavailable (see Environment notes).
 
 ## Architecture
 
@@ -90,8 +139,14 @@ Rust-style layering, one concern per module under `src/maki_trust_editor/`:
    after a save — it would discard other files' unsaved edits.
 6. **Append-only session writes.** A session write rewrites only the final meta
    line; everything before it is streamed unchanged.
-7. **Locked sessions are read-only and never saved.** `sessions.is_locked()` is
-   the single source of truth.
+7. **Locked sessions are read-only, never saved, and never dirty.**
+   `sessions.is_locked()` is the single source of truth. `_session_targets()`
+   skips any `view.locked` row, which covers saving, row/tab marks, and
+   `_dirty()` in one place. Why it matters: `_populate_row()` reloads a session
+   from disk (a live session grows), and maki rewriting a locked file while it
+   runs would otherwise make the reloaded rules differ from the baseline — a
+   spurious "unsaved changes" with no edit made. A locked row cannot be saved,
+   so it must never be a target.
 
 ## Saving model (per-file)
 
@@ -141,8 +196,11 @@ Rust-style layering, one concern per module under `src/maki_trust_editor/`:
 
 - **The `READ ONLY` reasoning is subtle:** a locked session shows all its rules
   but with every control disabled (`set_read_only`), including **+ Add tool
-  group** (`self._add_button`). The rules are still collected/saved-eligible in
-  principle, but `_drop_locked_sessions` guarantees they never are.
+  group** (`self._add_button`). It is excluded from `_session_targets()` (so it
+  is not dirty and not a save target), and `_drop_locked_sessions` is the
+  save-time backstop for a session that became locked after load. The two layers
+  are deliberate: `_session_targets()` uses the cached `view.locked`, while
+  `_drop_locked_sessions` re-probes live.
 - **`SessionView.reload()` canonicalizes rules** via `sessions.canonical_rules()`.
   Do not remove that: a freshly reloaded non-canonical-order session would look
   dirty.
@@ -170,11 +228,15 @@ startup lock state, every save (targets + result), the open-session skip, and an
 load problem. Logging is best-effort: an `OSError` means the app runs without a
 log.
 
-## Sandbox notes
+## Environment notes
 
-- `~/.local/state/` may need an explicit write grant; `~/.local/state/maki-trust-editor`
-  is the app's own state dir.
-- Git is unusable in at least one dev sandbox; recover by reading files, not
-  `git checkout`.
-- Do not execute scratch scripts from `/tmp` — they are blocked; keep them in the
-  project directory and delete them afterwards.
+- The app writes its own state under the platform state dir (see `paths.py`);
+  some environments need an explicit write grant there before the app, or the
+  test suite, can create it.
+- `/tmp` (or the system temp dir) may or may not be writable depending on the
+  distribution and sandbox: it is sometimes blocked, not always. Keep scratch
+  files inside the project directory and delete them when done.
+- A restricted sandbox may also break `git` (a version control operation fails
+  outright). If so, recover by reading files rather than `git checkout`.
+- Prefer `main`/feature branches, but never assume a network-dependent or VCS
+  command will behave the same everywhere; verify before relying on it.

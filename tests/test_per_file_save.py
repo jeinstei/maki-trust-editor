@@ -217,3 +217,34 @@ def test_locked_session_is_not_saved(app, tmp_path, monkeypatch) -> None:
 
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         handle.close()
+
+
+def test_locked_session_is_not_dirty_when_its_live_file_changes(app, tmp_path, monkeypatch) -> None:
+    state, config = _make_state(tmp_path, monkeypatch)
+    session_path = state / "sessions" / "a.jsonl"
+    _write_session(session_path, "a", [{"tool": "bash", "effect": "allow"}])
+    (config / "permissions.toml").write_text('default = "allow"\n', encoding="utf-8")
+    (state / "trusted-folders.json").write_text(
+        json.dumps({"version": 2, "folders": [], "rejected": []}), encoding="utf-8"
+    )
+
+    handle = _hold_lock(state, "a")
+    try:
+        window = MainWindow()
+        # maki rewrites the live session after the baseline was captured.
+        _write_session(
+            session_path,
+            "a",
+            [{"tool": "bash", "effect": "allow"}, {"tool": "read", "effect": "deny"}],
+        )
+        row = _row_of(window, "a")
+        window.sessions_tab.list.setCurrentRow(row)
+
+        assert window._dirty() is False
+        assert window.tabs.tabText(0) == "Sessions"
+        assert _row_text(window, row) == window.sessions_tab.row_label(row)
+    finally:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()

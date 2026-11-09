@@ -861,9 +861,17 @@ class MainWindow(QMainWindow):
         return row in self._session_targets()
 
     def _session_targets(self) -> dict[int, tuple[int, safe_write.WriteTarget]]:
-        """Dirty sessions keyed by list row, for saving and row markers."""
+        """Dirty sessions keyed by list row, for saving and row markers.
+
+        A locked session (maki holds it open) is never a target: it cannot be
+        saved, and maki rewrites the file while it runs, so the reload that
+        refreshes a locked session's view would otherwise show a spurious diff
+        against the baseline and mark it dirty with no edit made.
+        """
         dirty: dict[int, tuple[int, safe_write.WriteTarget]] = {}
         for row, view in enumerate(self.workspace.sessions):
+            if view.locked:
+                continue
             session = view.session
             if not session.has_rules_line:
                 continue

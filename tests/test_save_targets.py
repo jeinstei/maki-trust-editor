@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -17,7 +18,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "minimal")
 
 from qtpy.QtWidgets import QApplication  # noqa: E402
 
-from maki_trust_editor import paths  # noqa: E402
+from maki_trust_editor import paths, safe_write  # noqa: E402
 from maki_trust_editor.window import DIRTY_MARK, TAB_TITLES, MainWindow  # noqa: E402
 
 
@@ -251,3 +252,62 @@ def test_malformed_store_loads_empty_and_flashes(
 
     assert [p.path for p in window.workspace.problems] == [target]
     assert shown and str(target) in shown[0]
+
+
+def _edit_session(window: MainWindow, scope: str = "git *") -> None:
+    window.sessions_tab._editors[0][1].add_row(scope, "deny")
+
+
+def _maki_running(monkeypatch) -> None:
+    from qtpy.QtWidgets import QMessageBox
+
+    monkeypatch.setattr(
+        safe_write, "detect_maki", lambda: safe_write.MakiStatus(running=True, pids=[4242])
+    )
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.Yes)
+
+
+def test_unlocked_session_saves_while_maki_runs(window: MainWindow, monkeypatch) -> None:
+    window.sessions_tab.list.setCurrentRow(0)
+    _edit_session(window)
+    _maki_running(monkeypatch)
+
+    session = paths.sessions_dir() / "s1.jsonl"
+    before = session.read_text()
+    window._save()
+
+    assert session.read_text() != before
+    assert "git *" in session.read_text()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="open-fd detection is /proc-only")
+def test_blocked_targets_skips_shared_but_not_session(tmp_path: Path) -> None:
+    shared_path = tmp_path / "permissions.toml"
+    shared_path.write_text("x", encoding="utf-8")
+    handle = open(shared_path, "rb")
+    try:
+        shared = safe_write.WriteTarget(path=shared_path, content="x")
+        session = safe_write.WriteTarget(path=tmp_path / "a.jsonl", shared=False)
+        status = safe_write.MakiStatus(running=True, pids=[os.getpid()])
+
+        blocked = safe_write.blocked_targets([shared, session], status)
+
+        assert shared in blocked
+        assert session not in blocked
+    finally:
+        handle.close()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="open-fd detection is /proc-only")
+def test_shared_target_not_caught_open_is_not_blocked(tmp_path: Path) -> None:
+    shared = safe_write.WriteTarget(path=tmp_path / "permissions.toml", content="x")
+    status = safe_write.MakiStatus(running=True, pids=[os.getpid()])
+
+    assert safe_write.blocked_targets([shared], status) == []
+
+
+def test_blocked_targets_empty_when_maki_not_running(tmp_path: Path) -> None:
+    shared = safe_write.WriteTarget(path=tmp_path / "permissions.toml", content="x")
+    status = safe_write.MakiStatus(running=False, pids=[])
+
+    assert safe_write.blocked_targets([shared], status) == []
