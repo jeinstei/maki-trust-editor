@@ -21,7 +21,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "minimal")
 from qtpy.QtWidgets import QApplication  # noqa: E402
 
 from maki_trust_editor import paths, safe_write, sessions  # noqa: E402
-from maki_trust_editor.window import MainWindow  # noqa: E402
+from maki_trust_editor.window import DIRTY_MARK, MainWindow  # noqa: E402
 
 pytestmark = pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX flock probe only")
 
@@ -33,9 +33,13 @@ def app() -> QApplication:
     return QApplication.instance() or QApplication([])
 
 
-def _write_session(path: Path, session_id: str, allow: list[str]) -> None:
+def _write_session(path: Path, session_id: str, rules: list[dict] | None = None) -> None:
     header = {"t": "header", "id": session_id, "cwd": "/p", "model": "m"}
-    meta = {"t": "meta", "title": "t", "session_rules": [{"tool": "bash", "effect": "allow"}]}
+    meta = {
+        "t": "meta",
+        "title": "t",
+        "session_rules": rules or [{"tool": "bash", "effect": "allow"}],
+    }
     path.write_text("\n".join(json.dumps(x) for x in (header, meta)) + "\n", encoding="utf-8")
 
 
@@ -53,7 +57,7 @@ def _make_state(tmp_path: Path, monkeypatch, ids: list[str]) -> Path:
     )
     monkeypatch.setattr(paths, "global_permissions_path", lambda: config / "permissions.toml")
     for session_id in ids:
-        _write_session(state / "sessions" / f"{session_id}.jsonl", session_id, ["git *"])
+        _write_session(state / "sessions" / f"{session_id}.jsonl", session_id)
     (config / "permissions.toml").write_text('default = "allow"\n', encoding="utf-8")
     (state / "trusted-folders.json").write_text(
         json.dumps({"version": 2, "folders": [], "rejected": []}), encoding="utf-8"
@@ -143,6 +147,68 @@ def test_lock_appearing_parks_a_dirty_edit(app, tmp_path, monkeypatch) -> None:
         r.tool == "bash" and r.scope == "rm *" and r.effect == "deny" for r in parked
     ), "edit dropped"
     assert "parked" in window.status.text()
+
+
+def test_unlock_after_maki_rewrites_is_not_dirty(app, tmp_path, monkeypatch) -> None:
+    """maki rewriting a session while it holds it must not read as an edit.
+
+    A regression: the baseline was taken at load, so the content reloaded on
+    *unlock* (maki's own rewrite) differed from it and the row showed unsaved
+    changes the user never made.
+    """
+    sdir = _make_state(tmp_path, monkeypatch, ["s1"])
+    _no_maki(monkeypatch)
+    window = MainWindow()
+    window.sessions_tab.list.setCurrentRow(0)
+    assert not window._session_targets()
+
+    handle = _hold_lock(sdir, "s1")
+    try:
+        _write_session(
+            sdir / "s1.jsonl",
+            "s1",
+            rules=[{"tool": "bash", "effect": "allow"}, {"tool": "read", "effect": "deny"}],
+        )
+        window._refresh_liveness()
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        window._refresh_liveness()
+    finally:
+        handle.close()
+
+    assert window.workspace.sessions[0].locked is False
+    assert window._session_targets() == {}, "unlocking a session maki rewrote marked it dirty"
+    assert DIRTY_MARK not in window.sessions_tab.list.item(0).text()
+
+
+def test_parked_edit_survives_unlock_and_stays_dirty(app, tmp_path, monkeypatch) -> None:
+    """A parked edit is not re-baselined away when the session unlocks.
+
+    Unlock must adopt the *file's* content as baseline only when there is no
+    pending edit; a parked edit stays dirty so the user can still save it.
+    """
+    sdir = _make_state(tmp_path, monkeypatch, ["s1"])
+    _no_maki(monkeypatch)
+    window = MainWindow()
+    window.sessions_tab.list.setCurrentRow(0)
+    editor = window.sessions_tab._editors[0][1]
+    editor.add_row("rm *", "deny")
+    window.sessions_tab.commit()
+
+    handle = _hold_lock(sdir, "s1")
+    try:
+        window._refresh_liveness()
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        window._refresh_liveness()
+    finally:
+        handle.close()
+
+    assert window.workspace.sessions[0].locked is False
+    parked = window.workspace.sessions[0].session.rules
+    assert any(
+        r.scope == "rm *" and r.effect == "deny" for r in parked
+    ), "parked edit dropped by unlock"
+    assert window._session_targets(), "parked edit must be dirty again after unlock"
+    assert DIRTY_MARK in window.sessions_tab.list.item(0).text()
 
 
 def test_tick_announces_maki_start_and_exit(app, tmp_path, monkeypatch) -> None:

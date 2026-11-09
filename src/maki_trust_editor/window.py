@@ -1044,6 +1044,20 @@ class MainWindow(QMainWindow):
     def _session_row_dirty(self, row: int) -> bool:
         return row in self._session_targets()
 
+    def _session_pending_edit(self, row: int) -> bool:
+        """Whether a row holds an unsaved edit, ignoring its lock state.
+
+        ``_session_row_dirty`` answers "is this a save target", which excludes a
+        locked row. The liveness path needs the narrower question — did the user
+        change this row? — because a parked edit is still a pending edit, and
+        re-baselining it (as a clean row) would silently discard it.
+        """
+        view = self.workspace.sessions[row]
+        session = view.session
+        if not session.has_rules_line or session.path not in self._baseline:
+            return False
+        return session.rules_line() != self._baseline[session.path]
+
     def _session_targets(self) -> dict[int, tuple[int, safe_write.WriteTarget]]:
         """Dirty sessions keyed by list row, for saving and row markers.
 
@@ -1263,19 +1277,28 @@ class MainWindow(QMainWindow):
         An edit is left alone (reloading would drop it): it is parked, marked,
         and simply stops being a save target. The active row's editor is
         re-populated so the change is visible at once.
+
+        Every row reloaded while clean is re-baselined: maki rewrites a session's
+        rules while it holds it open, so the copy reloaded on the lock *or* the
+        unlock differs from the baseline taken at load. Without advancing it, the
+        unlock would compare maki's own rewrite against the old baseline and mark
+        a session the user never touched as dirty.
         """
         sessions_dir = paths.sessions_dir()
         shown = self.sessions_tab._shown
         parked: set[int] = set()
+        rebaselined: set[int] = set()
         for row in rows:
             view = self.workspace.sessions[row]
             now_locked = sessions.is_locked(sessions_dir, view.session.session_id)
-            dirty = self._session_row_dirty(row)
-            if now_locked and dirty:
+            pending = self._session_pending_edit(row)
+            if now_locked and pending:
                 self._park_on_lock(row)
                 parked.add(row)
-            elif not dirty and row != shown:
-                view.reload()
+            elif not pending:
+                if row != shown:
+                    view.reload()
+                rebaselined.add(row)
             view.locked = now_locked
         if shown in rows and shown not in parked:
             self.sessions_tab._populate_row(shown)
@@ -1284,6 +1307,19 @@ class MainWindow(QMainWindow):
             # from the dirty set, so _populate_row's guard reads it as clean and
             # re-reads the file, dropping the edit. Flip the editor in place.
             self.sessions_tab.set_read_only(True)
+        for row in rebaselined:
+            self._rebaseline_session(self.workspace.sessions[row])
+
+    def _rebaseline_session(self, view: workspace.SessionView) -> None:
+        """Adopt a reloaded session's rules as its baseline.
+
+        A reload that is not a user edit (maki rewriting a session it holds) must
+        move the baseline with it, or the next dirty check reads that rewrite as
+        an edit. Mirrors the session branch of ``_capture_baselines``.
+        """
+        session = view.session
+        if session.has_rules_line:
+            self._baseline[session.path] = session.rules_line()
         self.sessions_tab.sync_labels()
 
     def _park_on_lock(self, row: int) -> None:

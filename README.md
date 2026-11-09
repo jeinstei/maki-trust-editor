@@ -151,7 +151,9 @@ seconds, and whenever the window regains focus) notices a session maki opens or
 closes without a reload, flipping the row read-only or editable on the spot. If
 maki opens a session you have already edited, your edit is kept but *parked* —
 the row stops being writable and the status line tells you so; only reloading
-discards it.
+discards it. When maki *closes* a session it may have rewritten the file as it
+ran, and the app picks that up on the next refresh without marking the row as
+unsaved on its own.
 
 ## Good to know
 

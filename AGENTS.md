@@ -50,7 +50,7 @@ Python specifics (the analogue of the root's Rust idioms):
   **timeout**. A `QMessageBox` modal under the `minimal` platform hangs forever;
   any test that can trigger a dialog must stub it or guarantee it does not fire.
 - `ruff check src tests` and `black --check src tests` must be clean.
-- 129 tests as of last change. Keep them fast (whole suite well under a couple of
+- 131 tests as of last change. Keep them fast (whole suite well under a couple of
   seconds).
 
 ### Verification pipeline
@@ -259,7 +259,19 @@ section does not bring it back.
   so a parked (locked + edited) row reads as clean and `_populate_row` would
   reload it, dropping the edit. `_apply_lock_changes` therefore calls
   `SessionsTab.set_read_only(True)` in place for a parked shown row instead of
-  re-populating it.
+  re-populating it. The dirty test it uses is `_session_pending_edit`, a
+  **lock-agnostic** check (model's `rules_line()` vs `_baseline`) — not
+  `_session_row_dirty`, which excludes locked rows and would read a parked row as
+  clean, so the parked edit would be silently re-baselined and lose its mark.
+- **Unlock re-baselines, or it invents a spurious dirty.** When a lock vanishes
+  (`_apply_lock_changes`), the row is reloaded because maki may have rewritten
+  the file while it held the lock. The baseline was captured at load, so that
+  reload differs from it and marks a session the user never touched as dirty.
+  `_rebaseline_session` therefore advances `_baseline[path]` to the freshly
+  reloaded `rules_line()` whenever the row is clean (and `has_rules_line`).
+  Tests: `test_unlock_after_maki_rewrites_is_not_dirty` (the bug) and
+  `test_parked_edit_survives_unlock_and_stays_dirty` (the parked edit must *not*
+  be re-baselined).
 - **`SessionView.reload()` canonicalizes rules** via `sessions.canonical_rules()`.
   Do not remove that: a freshly reloaded non-canonical-order session would look
   dirty.
