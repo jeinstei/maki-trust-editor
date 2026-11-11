@@ -18,8 +18,26 @@ os.environ.setdefault("QT_QPA_PLATFORM", "minimal")
 
 from qtpy.QtWidgets import QApplication  # noqa: E402
 
-from maki_trust_editor import paths, safe_write  # noqa: E402
-from maki_trust_editor.window import DIRTY_MARK, TAB_TITLES, MainWindow  # noqa: E402
+from maki_trust_editor import changes, paths, safe_write  # noqa: E402
+from maki_trust_editor.window import (  # noqa: E402
+    DIRTY_MARK,
+    TAB_TITLES,
+    MainWindow,
+    SaveDialog,
+)
+
+
+@pytest.fixture
+def accept_save(monkeypatch) -> list:
+    """Answer the save review with Write, recording what it listed."""
+    reviews: list[changes.ChangeList] = []
+
+    def _exec(self):
+        reviews.append(self.review)
+        return 1
+
+    monkeypatch.setattr(SaveDialog, "exec", _exec)
+    return reviews
 
 
 @pytest.fixture(scope="module")
@@ -98,7 +116,7 @@ def test_edited_tab_title_gets_dirty_mark(window: MainWindow) -> None:
     assert window.tabs.tabText(0) == "Sessions"
 
 
-def test_dirty_mark_clears_after_save(window: MainWindow, monkeypatch) -> None:
+def test_dirty_mark_clears_after_save(window: MainWindow, accept_save, monkeypatch) -> None:
     from maki_trust_editor import safe_write
 
     monkeypatch.setattr(

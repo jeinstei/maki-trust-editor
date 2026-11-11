@@ -7,6 +7,7 @@ requires-python = ">=3.10"
 dependencies = [
     "qtpy>=2.4",
     "tomlkit>=0.12",
+    "pyqtdarktheme",
 ]
 
 [project.optional-dependencies]

@@ -29,6 +29,7 @@ import os
 import shutil
 import sys
 import uuid
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -163,14 +164,15 @@ class ToolGroup:
         return rules
 
 
-def canonical_rules(rules: list[SessionRule]) -> list[SessionRule]:
-    """Rules in the canonical order a save writes (tools sorted, scopes first).
+def rule_set(rules: list[SessionRule]) -> Counter[tuple[str, str | None, str]]:
+    """The rules as a multiset, for change detection that ignores order.
 
-    A freshly loaded session keeps the file's raw order, which may differ from
-    this, so it must be canonicalized before it is compared with the baseline or
-    an untouched session would look edited.
+    Comparing serialized lines made a reload look like an edit: maki writes its
+    own order and spacing, while re-serializing from the parsed model cannot
+    reproduce either. Rules carry no meaning in their order, so the comparison
+    asks whether the same rules are present, counting duplicates.
     """
-    return [rule for group in ToolGroup.group(rules) for rule in group.to_rules()]
+    return Counter((rule.tool, rule.scope, rule.effect) for rule in rules)
 
 
 @dataclass

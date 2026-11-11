@@ -39,7 +39,9 @@ def app() -> QApplication:
 @pytest.fixture
 def tab(app: QApplication) -> SessionsTab:
     return SessionsTab(
-        on_rules_changed=lambda: None, commit=lambda: None, is_dirty=lambda row: False
+        on_change=lambda: None,
+        is_dirty=lambda row: False,
+        rebaselined=lambda view: None,
     )
 
 

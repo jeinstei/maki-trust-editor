@@ -188,6 +188,17 @@ To force a language, set the `MAKI_TRUST_EDITOR_LANG` environment variable, for
 example `MAKI_TRUST_EDITOR_LANG=de_DE`. An unknown value is ignored and the
 system locale is used.
 
+## Theme
+
+Right-click anywhere in the window to pick **Dark** (the default), **Light**, or
+**Follow system**. The choice is remembered across runs, and switching applies
+immediately.
+
+**Follow system** relies on [darkdetect](https://github.com/albertosottile/darkdetect),
+which on Linux reads only the GTK theme, so it follows your GTK/desktop theme
+but not, for example, a KDE Plasma color scheme. If it cannot detect a dark
+theme it reports light; pick **Dark** explicitly in that case.
+
 ## Closing with unsaved changes
 
 If you close the window with unsaved changes, the app asks first. Cancelling

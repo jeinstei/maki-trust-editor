@@ -17,7 +17,8 @@ import logging.handlers
 import signal
 import sys
 
-from qtpy.QtCore import QTimer
+import qdarktheme
+from qtpy.QtCore import QSettings, QTimer
 from qtpy.QtWidgets import QApplication
 
 from . import i18n, paths
@@ -25,6 +26,76 @@ from .window import MainWindow
 
 HEARTBEAT_MS = 200
 LOGGER = logging.getLogger("maki_trust_editor")
+
+# The theme names are qdarktheme's own (`dark`, `light`, `auto`), so there is no
+# second vocabulary to map: the menu shows "light" and stores `light`, and
+# "follow system" stores `auto`. Only the default is ours, and it is dark.
+# `auto` asks darkdetect which the OS prefers; when detection returns None
+# qdarktheme applies DEFAULT_THEME, while a desktop whose scheme it cannot read
+# (KDE with a dark scheme on some setups) reports Light and the app honestly
+# renders light, so the menu shows what `auto` currently resolves to.
+DEFAULT_THEME = "dark"
+THEME_SETTINGS_KEY = "ui/theme_mode"
+
+
+def load_theme_mode() -> str:
+    """The saved theme name, or the default when unset or unusable.
+
+    A name from a newer build (or a hand-edited file) is checked against
+    ``qdarktheme.get_themes()`` and rejected, since qdarktheme would raise on it.
+    """
+    try:
+        stored = QSettings().value(THEME_SETTINGS_KEY, DEFAULT_THEME, type=str)
+    except Exception:  # noqa: BLE001 - a settings backend failure must not stop the app
+        LOGGER.warning("could not read the saved theme, using %s", DEFAULT_THEME, exc_info=True)
+        return DEFAULT_THEME
+    if stored not in qdarktheme.get_themes():
+        LOGGER.info("ignoring unknown saved theme %r, using %s", stored, DEFAULT_THEME)
+        return DEFAULT_THEME
+    return stored
+
+
+def save_theme_mode(mode: str) -> None:
+    """Remember {mode} across runs. Best effort: a failed write is logged only."""
+    try:
+        settings = QSettings()
+        settings.setValue(THEME_SETTINGS_KEY, mode)
+        settings.sync()
+    except Exception:  # noqa: BLE001
+        LOGGER.warning("could not save the theme mode %r", mode, exc_info=True)
+
+
+def resolved_theme(mode: str) -> str:
+    """The concrete theme {mode} renders to now: ``dark`` or ``light``.
+
+    Only ``auto`` is indirect: it asks darkdetect, and None (detection
+    unavailable) means qdarktheme applies DEFAULT_THEME.
+    """
+    if mode != "auto":
+        return mode
+    try:
+        import darkdetect
+
+        detected = darkdetect.theme()
+    except Exception:  # noqa: BLE001
+        LOGGER.warning("system theme detection failed, using %s", DEFAULT_THEME, exc_info=True)
+        return DEFAULT_THEME
+    return detected.lower() if detected else DEFAULT_THEME
+
+
+def apply_theme(mode: str, *, save: bool = True) -> str:
+    """Apply {mode} to the running app and optionally persist it.
+
+    qdarktheme re-sets the application stylesheet and palette on every call, so
+    this switches live with no restart. ``auto`` starts a listener that re-themes
+    when the OS changes; an explicit name stops it. Returns the name applied.
+    """
+    if mode not in qdarktheme.get_themes():
+        mode = DEFAULT_THEME
+    qdarktheme.setup_theme(mode, default_theme=DEFAULT_THEME)
+    if save:
+        save_theme_mode(mode)
+    return mode
 
 
 def setup_logging() -> None:
@@ -117,7 +188,12 @@ class InterruptController:
 def main() -> int:
     setup_logging()
     app = QApplication(sys.argv)
+    # Named before anything reads QSettings: the store path is derived from the
+    # organization and application names, so setting them later would land the
+    # theme preference in a different file than the one it is read back from.
+    app.setOrganizationName("maki")
     app.setApplicationName("maki trust editor")
+    apply_theme(load_theme_mode(), save=False)
     # Install translators before any widget is built: a widget captures its text
     # when constructed, so a translator installed afterwards would miss it.
     translators = i18n.install(app)

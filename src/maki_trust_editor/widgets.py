@@ -12,6 +12,7 @@ from __future__ import annotations
 import re
 
 from qtpy.QtCore import Qt
+from qtpy.QtGui import QPalette
 from qtpy.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -183,7 +184,8 @@ class ScopeRulesEditor(QWidget):
         self._unknown_label = QLabel()
         self._unknown_label.setWordWrap(True)
         self._unknown_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self._unknown_label.setStyleSheet("font-family: monospace; color: #888;")
+        self._unknown_label.setStyleSheet("font-family: monospace;")
+        self._unknown_label.setForegroundRole(QPalette.ColorRole.PlaceholderText)
         self._unknown_label.hide()
         outer.addWidget(self._unknown_label)
 
@@ -335,7 +337,7 @@ class ScopedHolder(QWidget):
         self._empty_hint = QLabel(empty_hint)
         self._empty_hint.setWordWrap(True)
         self._empty_hint.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self._empty_hint.setStyleSheet("color: #888;")
+        self._empty_hint.setForegroundRole(QPalette.ColorRole.PlaceholderText)
         self._empty_hint.setVisible(bool(empty_hint))
         self._inner_layout.addWidget(self._empty_hint)
         self._stretch = self._inner_layout.addStretch(1)

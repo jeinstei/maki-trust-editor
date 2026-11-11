@@ -248,3 +248,77 @@ def test_locked_session_is_not_dirty_when_its_live_file_changes(app, tmp_path, m
 
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         handle.close()
+
+
+def _write_maki_session(path: Path, sid: str, rules: list[dict]) -> None:
+    """Write a session the way maki does: compact separators, its own rule order."""
+    header = {"t": "header", "id": sid, "cwd": "/p", "model": "m"}
+    meta = {"t": "meta", "title": sid, "session_rules": rules}
+    path.write_text(
+        "\n".join(json.dumps(x, separators=(",", ":")) for x in (header, meta)) + "\n",
+        encoding="utf-8",
+    )
+
+
+@pytest.fixture
+def maki_ordered_session(app: QApplication, tmp_path: Path, monkeypatch) -> MainWindow:
+    """Sessions whose rule order on disk differs from the order the editor sorts into.
+
+    ``edit`` before ``bash`` and a scope-less rule between scoped ones is the
+    shape maki writes and the editor reorders, which is what made a reload read
+    as an edit.
+    """
+    state, config = _make_state(tmp_path, monkeypatch)
+    _write_maki_session(
+        state / "sessions" / "a.jsonl",
+        "a",
+        [
+            {"tool": "edit", "scope": "/x/**", "effect": "allow"},
+            {"tool": "bash", "scope": "git *", "effect": "allow"},
+            {"tool": "bash", "effect": "deny"},
+            {"tool": "read", "scope": "/y/**", "effect": "deny"},
+        ],
+    )
+    _write_session(state / "sessions" / "b.jsonl", "b", [{"tool": "read", "effect": "allow"}])
+    (config / "permissions.toml").write_text('default = "allow"\n', encoding="utf-8")
+    (state / "trusted-folders.json").write_text(
+        json.dumps({"version": 2, "folders": [], "rejected": []}), encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        safe_write, "detect_maki", lambda: safe_write.MakiStatus(running=False, pids=[])
+    )
+    window = MainWindow()
+    window._liveness_timer.stop()
+    return window
+
+
+def test_switching_sessions_never_marks_a_maki_ordered_session_dirty(
+    maki_ordered_session: MainWindow,
+) -> None:
+    """A session maki wrote in its own order is clean after a reload.
+
+    The dirty check used to compare serialized meta lines: reloading re-parses
+    and re-serializes, which cannot reproduce maki's rule order or its compact
+    separators. Clicking rows only, with no edit, reported unsaved changes and
+    prompted on close.
+    """
+    window = maki_ordered_session
+    row = _row_of(window, "a")
+    window.sessions_tab.list.setCurrentRow(row)
+    window.sessions_tab.list.setCurrentRow(_row_of(window, "b"))
+    window.sessions_tab.list.setCurrentRow(row)
+
+    assert window._session_targets() == {}
+    assert _row_text(window, row) == window.sessions_tab.row_label(row)
+    assert window._dirty() is False
+
+
+def test_reordering_rules_alone_is_not_dirty(maki_ordered_session: MainWindow) -> None:
+    """The comparison is a rule set: same rules in the same file order stay clean."""
+    window = maki_ordered_session
+    row = _row_of(window, "a")
+    window.sessions_tab.list.setCurrentRow(row)
+    session = window.workspace.sessions[row].session
+    session.rules.reverse()
+
+    assert window._session_targets() == {}

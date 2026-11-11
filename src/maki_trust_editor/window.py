@@ -20,7 +20,7 @@ import re
 import time
 
 from qtpy.QtCore import Qt, QTimer
-from qtpy.QtGui import QFontMetrics, QKeySequence, QShortcut
+from qtpy.QtGui import QFontMetrics, QKeySequence, QPalette, QShortcut
 from qtpy.QtWidgets import (
     QApplication,
     QDialog,
@@ -44,7 +44,7 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
-from . import paths, permissions, safe_write, sessions, workspace
+from . import changes, folders, paths, permissions, safe_write, sessions, workspace
 from .permissions import EFFECT_ALLOW, McpServerRules, ToolRules
 from .widgets import ScopedHolder, ScopeRulesEditor
 
@@ -59,6 +59,8 @@ DIRTY_MARK = " *"
 # the header records ``created_at`` in whole seconds, so the two differ by under
 # a second even when they agree. Anything past this is a real disagreement.
 CREATED_AT_TOLERANCE_S = 2
+# Tall enough to list a full session's rules without scrolling to find the point.
+SAVE_DIALOG_LIST_HEIGHT = 260
 # Tab labels in addTab order, so titles can be rebuilt with the dirty marker
 # without repeating the strings.
 TAB_TITLES = ("Sessions", "Projects", "Folders", "Global")
@@ -122,7 +124,8 @@ class PermissionsTab(QWidget):
         self.path_label = QLabel(empty_hint)
         self.path_label.setWordWrap(True)
         self.path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.path_label.setStyleSheet("font-family: monospace; color: #888;")
+        self.path_label.setStyleSheet("font-family: monospace;")
+        self.path_label.setForegroundRole(QPalette.ColorRole.PlaceholderText)
         layout.addWidget(self.path_label)
 
         self.scoped = ScopedHolder("Rules", self._rules_hint)
@@ -232,12 +235,13 @@ class PermissionsTab(QWidget):
 
 
 class SessionsTab(QWidget):
-    def __init__(self, on_rules_changed, commit, is_dirty) -> None:
+    def __init__(self, on_change, is_dirty, rebaselined) -> None:
         super().__init__()
         self._views: list[workspace.SessionView] = []
         self._current: workspace.Session | None = None
-        self._commit = commit
+        self._on_change = on_change
         self._is_dirty = is_dirty
+        self._rebaselined = rebaselined
 
         layout = QHBoxLayout(self)
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -257,7 +261,8 @@ class SessionsTab(QWidget):
         right_layout = QVBoxLayout(right)
         self.file_label = QLabel(self.tr("file: (none)"))
         self.file_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.file_label.setStyleSheet("font-family: monospace; color: #888;")
+        self.file_label.setStyleSheet("font-family: monospace;")
+        self.file_label.setForegroundRole(QPalette.ColorRole.PlaceholderText)
         self.file_label.setWordWrap(True)
         right_layout.addWidget(self.file_label)
         self.header = QLabel(self.tr("Select a session"))
@@ -270,7 +275,6 @@ class SessionsTab(QWidget):
         )
         right_layout.addWidget(self.scoped)
         self._editors: list[tuple[str, ScopeRulesEditor]] = []
-        self._on_rules_changed = on_rules_changed
 
         self._add_button = QPushButton(self.tr("+ Add tool group"))
         self._add_button.clicked.connect(self._add_group)
@@ -319,10 +323,10 @@ class SessionsTab(QWidget):
         if row != self._shown:
             # Park the outgoing session's edits in its model so they survive the
             # switch (dirty persists across clicks) instead of being dropped.
-            self._commit()
+            self._on_change()
         self._populate_row(row)
 
-    def _populate_row(self, row: int) -> None:
+    def _populate_row(self, row: int, *, reload: bool = True) -> None:
         self._shown = row
         self.loading = True
         self.scoped.clear_editors()
@@ -340,15 +344,21 @@ class SessionsTab(QWidget):
         # copy loaded at startup has a stale last-line offset. Loading fresh
         # keeps the rules (and the offset a save writes from) current. A row
         # with a pending edit is left alone: reloading would drop it.
-        if not self._is_dirty(row):
-            view.reload()
+        #
+        # A clean reload moves the baseline with it: the fresh copy is the truth,
+        # not an edit, and comparing it against the baseline taken at startup
+        # would flag a session that changed on disk (maki rewriting it) as dirty
+        # the moment it is opened. The lock path re-baselines for the same reason.
+        if reload and not self._is_dirty(row):
+            if view.reload():
+                self._rebaselined(view)
         session = view.session
         self._current = session
         self.scoped.set_empty_hint(self._rules_hint)
         self.file_label.setText(self.tr("file: {path}").format(path=session.path))
         self.header.setText(self._session_header(session))
         for group in sessions.ToolGroup.group(session.rules):
-            editor = ScopeRulesEditor(self._on_rules_changed)
+            editor = ScopeRulesEditor(self._on_change)
             editor.set_section(None, group.all_effect)
             for scope, effect in group.scopes:
                 editor.add_row(scope, effect)
@@ -454,7 +464,7 @@ class SessionsTab(QWidget):
                 self.tr("A group named '{name}' already exists.").format(name=name),
             )
             return
-        editor = ScopeRulesEditor(self._on_rules_changed)
+        editor = ScopeRulesEditor(self._on_change)
         editor.add_row("", EFFECT_ALLOW)
         self.scoped.add_editor(name, editor)
         self._editors.append((name, editor))
@@ -469,6 +479,48 @@ class SessionsTab(QWidget):
             )
             rules.extend(group.to_rules())
         return rules
+
+
+class SaveDialog(QDialog):
+    """Show what a save will write, and let the user back out.
+
+    A rule can be edited in a section that is not on screen, so the confirmation
+    lists the changes rather than trusting the visible editor to have shown
+    them. Cancel writes nothing and leaves every edit pending.
+    """
+
+    def __init__(self, parent, review: changes.ChangeList):
+        super().__init__(parent)
+        self.review = review
+        self.setWindowTitle(self.tr("Save changes"))
+        layout = QVBoxLayout(self)
+        layout.addWidget(
+            QLabel(
+                self.tr("{path}\n\nThese changes will be written to disk:").format(path=review.path)
+            )
+        )
+        listed = QListWidget()
+        for change in review.changes:
+            listed.addItem(QListWidgetItem(change.line()))
+        listed.setMinimumHeight(SAVE_DIALOG_LIST_HEIGHT)
+        layout.addWidget(listed)
+        if review.stale:
+            layout.addWidget(
+                QLabel(
+                    self.tr(
+                        "This file changed on disk since it was loaded; the list "
+                        "compares against its current content."
+                    )
+                )
+            )
+        button_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        button_box.button(QDialogButtonBox.StandardButton.Ok).setText(self.tr("Write"))
+        button_box.button(QDialogButtonBox.StandardButton.Cancel).setText(self.tr("Cancel"))
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
 
 
 class FolderDialog(QDialog):
@@ -512,7 +564,8 @@ class FoldersTab(QWidget):
         layout = QVBoxLayout(self)
         self.file_label = QLabel(self.tr("file: (none)"))
         self.file_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.file_label.setStyleSheet("font-family: monospace; color: #888;")
+        self.file_label.setStyleSheet("font-family: monospace;")
+        self.file_label.setForegroundRole(QPalette.ColorRole.PlaceholderText)
         self.file_label.setWordWrap(True)
         layout.addWidget(self.file_label)
         layout.addWidget(
@@ -548,7 +601,8 @@ class FoldersTab(QWidget):
         box = QVBoxLayout(group)
         self.pre_trust_label = QLabel(self.tr("file: (none)"))
         self.pre_trust_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.pre_trust_label.setStyleSheet("font-family: monospace; color: #888;")
+        self.pre_trust_label.setStyleSheet("font-family: monospace;")
+        self.pre_trust_label.setForegroundRole(QPalette.ColorRole.PlaceholderText)
         self.pre_trust_label.setWordWrap(True)
         box.addWidget(self.pre_trust_label)
         box.addWidget(
@@ -721,7 +775,11 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.status)
 
         self.tabs = QTabWidget()
-        self.sessions_tab = SessionsTab(self._mark_dirty, self._mark_dirty, self._session_row_dirty)
+        self.sessions_tab = SessionsTab(
+            self._mark_dirty,
+            self._session_row_dirty,
+            lambda view: self._rebaseline_session(view, sync=False),
+        )
         self.global_tab = PermissionsTab(
             self.tr("No global permissions file yet."), self._mark_dirty
         )
@@ -747,13 +805,16 @@ class MainWindow(QMainWindow):
         bar = QHBoxLayout()
         save = QPushButton(self.tr("Save"))
         save.clicked.connect(self._save)
-        reload_btn = QPushButton(self.tr("Reload"))
-        reload_btn.clicked.connect(self._reload)
+        reload_all = QPushButton(self.tr("Reload all"))
+        reload_all.clicked.connect(self._reload)
+        self.reload_file_btn = QPushButton(self.tr("Reload file"))
+        self.reload_file_btn.clicked.connect(self._reload_current)
         self.add_tool_btn = QPushButton(self.tr("+ Tool section (project)"))
         self.add_tool_btn.clicked.connect(self._add_project_tool)
         self.add_mcp_btn = QPushButton(self.tr("+ MCP server (project)"))
         self.add_mcp_btn.clicked.connect(self._add_project_mcp)
-        bar.addWidget(reload_btn)
+        bar.addWidget(reload_all)
+        bar.addWidget(self.reload_file_btn)
         bar.addWidget(self.add_tool_btn)
         bar.addWidget(self.add_mcp_btn)
         bar.addStretch(1)
@@ -761,6 +822,8 @@ class MainWindow(QMainWindow):
         layout.addLayout(bar)
 
         self.setCentralWidget(central)
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._show_theme_menu)
         self._setup_shortcuts()
         self._populate()
 
@@ -776,6 +839,48 @@ class MainWindow(QMainWindow):
     def _setup_shortcuts(self) -> None:
         QShortcut(QKeySequence("Ctrl+S"), self, activated=self._save)
         QShortcut(QKeySequence("Ctrl+R"), self, activated=self._reload)
+
+    def _show_theme_menu(self, pos) -> None:
+        """Right-click menu: pick dark, light, or follow the system.
+
+        The three are mutually exclusive and the saved choice is checked. ``auto``
+        carries the theme it currently resolves to, so a system whose scheme maki
+        cannot detect (it reports light) is visible rather than a silent surprise.
+        Applying happens after the menu closes, since re-styling the app while its
+        own popup is open is the one unreliable moment for a live theme switch.
+        The theme helpers live in ``app`` and are imported here rather than at
+        module scope: ``app`` imports this module, so a top-level import would be
+        a cycle.
+        """
+        import qdarktheme
+        from qtpy.QtWidgets import QActionGroup, QMenu
+
+        from .app import apply_theme, load_theme_mode, resolved_theme
+
+        # `auto` is the one label that is not static: it carries the theme the
+        # system currently resolves to, so a detection that reports light is
+        # visible rather than a silent surprise.
+        labels = {
+            "dark": self.tr("Dark theme"),
+            "light": self.tr("Light theme"),
+            "auto": self.tr("Follow system ({theme})").format(theme=resolved_theme("auto")),
+        }
+
+        current = load_theme_mode()
+        menu = QMenu(self)
+        group = QActionGroup(menu)
+        group.setExclusive(True)
+        actions = {}
+        for mode in qdarktheme.get_themes():
+            action = menu.addAction(labels[mode])
+            action.setCheckable(True)
+            action.setChecked(mode == current)
+            group.addAction(action)
+            actions[action] = mode
+
+        picked = menu.exec(self.mapToGlobal(pos))
+        if picked in actions:
+            apply_theme(actions[picked])
 
     def changeEvent(self, event) -> None:
         if event.type() == event.Type.ActivationChange and self.isActiveWindow():
@@ -867,8 +972,7 @@ class MainWindow(QMainWindow):
             session = view.session
             if not session.has_rules_line:
                 continue
-            session.rules = sessions.canonical_rules(session.rules)
-            self._baseline[session.path] = session.rules_line()
+            self._baseline[session.path] = sessions.rule_set(session.rules)
         for view in self.workspace.projects:
             file = view.permissions_file
             self._baseline[file.path] = file.to_toml()
@@ -899,15 +1003,32 @@ class MainWindow(QMainWindow):
     def _mark_dirty(self) -> None:
         """Push the edited widgets into their model, then refresh marks.
 
-        Committing on every edit keeps the model equal to what is on screen, so
-        a dirty check is a pure comparison and a switch-away needs no special
-        handling: the edit is already parked where Save will find it.
+        Commit on every change keeps the model equal to what is on screen, so a
+        dirty check is a pure comparison and a switch-away needs no special
+        handling. The status line is derived from that comparison rather than
+        from this handler having run: opening a session rebuilds its editor and
+        fires the same callbacks, and announcing "unsaved changes" there was a
+        claim nothing had made true.
         """
         if self._loading or self.sessions_tab.loading:
             return
         self._commit_current()
         self._refresh_marks()
-        self._update_status(self.tr("Unsaved changes."))
+        dirty = sorted(self._session_targets())
+        LOGGER.info("change: dirty rows=%s", dirty)
+        self._update_status(
+            self.tr("Unsaved changes.") if self._dirty() else self.tr("No unsaved changes.")
+        )
+
+    def _log_dirty(self, event: str) -> None:
+        """Record which rows count as dirty after an event that can move a
+        baseline, so a phantom mark can be traced to the step that caused it."""
+        LOGGER.info(
+            "%s: dirty rows=%s locked=%s",
+            event,
+            sorted(self._session_targets()),
+            [v.session.session_id for v in self.workspace.sessions if v.locked],
+        )
 
     def _dirty(self) -> bool:
         """Whether the visible editors differ from what was loaded.
@@ -935,6 +1056,12 @@ class MainWindow(QMainWindow):
         self._commit_tab(self.tabs.currentIndex())
 
     def closeEvent(self, event) -> None:
+        LOGGER.info(
+            "close: session rows=%s projects=%s tab=%d",
+            sorted(self._session_targets()),
+            sorted(self._project_targets()),
+            self.tabs.currentIndex(),
+        )
         if self._force_close or not self._dirty():
             event.accept()
             return
@@ -951,27 +1078,170 @@ class MainWindow(QMainWindow):
             event.ignore()
 
     def _reload(self) -> None:
-        if not self._confirm_discard():
+        if not self._confirm_discard(self.tr("Reloading all files")):
             return
         self.workspace = workspace.load_workspace()
         self._populate()
 
-    def _confirm_discard(self) -> bool:
+    def _pending_names(self) -> list[str]:
+        """Human labels of every store holding an unsaved edit, for a warning.
+
+        Naming them is the point: a bare "you have unsaved changes" cannot tell
+        a reload over a file the user is editing from one that merely has an
+        unrelated edit elsewhere. Derived from ``_changed_stores`` so a store
+        that can be saved can never be missing from the list.
+        """
+        return sorted({target.path.name for _, target in self._changed_stores()})
+
+    def _global_dirty(self) -> bool:
+        """Whether the global permissions file differs from its baseline."""
+        file = self.workspace.global_permissions
+        if file is None or file.path not in self._baseline:
+            return False
+        return file.to_toml() != self._baseline[file.path]
+
+    def _dirty_names(self, target: safe_write.WriteTarget | None) -> list[str]:
+        """The name of ``target`` if it is pending, else empty: asks nothing.
+
+        A per-file reload passes the file it is about to re-read, so it prompts
+        only when that file holds an edit and stays silent otherwise.
+        """
+        if target is None:
+            return []
+        paths_pending = {t.path for _, t in self._changed_stores()}
+        return [target.path.name] if target.path in paths_pending else []
+
+    def _confirm_discard(self, action: str, names: list[str] | None = None) -> bool:
         """Ask before an action that drops unsaved edits; True to proceed.
 
-        Reload re-reads every store, so any edit not yet saved is gone. Close
-        already guards this; Reload must too, or a stray Ctrl+R loses work.
+        {action} completes "Reloading ... will discard them" and {names} is what
+        is at risk (default: every dirty store). Reloading re-reads from disk, so
+        any edit not yet saved is gone: Close guards this, and every reload must
+        too, or a stray click loses work.
         """
-        if not self._dirty():
+        at_risk = self._pending_names() if names is None else names
+        if not at_risk:
             return True
+        listed = "\n".join(f"  · {name}" for name in at_risk)
         answer = QMessageBox.question(
             self,
             self.tr("Unsaved changes"),
-            self.tr("You have unsaved changes. Reload and discard them?"),
+            self.tr("{action} will discard the unsaved changes in:\n{names}").format(
+                action=action, names=listed
+            ),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Cancel,
         )
         return answer == QMessageBox.StandardButton.Yes
+
+    def _reload_current(self) -> None:
+        """Re-read the one file the current tab shows, discarding only its edits.
+
+        The global Reload re-reads every store; this one is for when a single
+        file went stale (a running maki rewrote it) and re-reading everything
+        would be a pointless disturbance. Folders pairs two files that belong
+        together, so both are re-read as a unit, matching how Save writes them.
+        """
+        index = self.tabs.currentIndex()
+        if index == SESSIONS_TAB:
+            row = self.sessions_tab.list.currentRow()
+            if 0 <= row < len(self.workspace.sessions):
+                self._reload_session_row(row)
+            return
+        if index == PROJECTS_TAB:
+            row = self.projects_selector.currentRow()
+            if 0 <= row < len(self.workspace.projects):
+                self._reload_project_row(row)
+            return
+        if index == GLOBAL_TAB:
+            self._reload_global()
+            return
+        self._reload_folders()
+
+    def _reload_session_row(self, row: int) -> None:
+        view = self.workspace.sessions[row]
+        target = self._session_targets().get(row)
+        names = self._dirty_names(None if target is None else target[1])
+        if not self._confirm_discard(self.tr("Reloading this session"), names):
+            return
+        was_locked = view.locked
+        if not view.reload():
+            self._update_status(self.tr("Could not re-read {name}.").format(name=view.label))
+            return
+        self._rebaseline_session(view)
+        # reload=False: view.reload() above already re-read the file, so letting
+        # _populate_row reload again would parse it a second time for nothing.
+        self.sessions_tab._populate_row(row, reload=False)
+        self._refresh_marks()
+        LOGGER.info(
+            "reload: session=%s locked=%s->%s",
+            view.session.session_id,
+            was_locked,
+            view.locked,
+        )
+        self._update_status(self.tr("Reloaded {name}.").format(name=view.label))
+
+    def _reload_project_row(self, row: int) -> None:
+        view = self.workspace.projects[row]
+        target = self._project_targets().get(row)
+        names = self._dirty_names(None if target is None else target[1])
+        if not self._confirm_discard(self.tr("Reloading this project"), names):
+            return
+        if not view.reload():
+            self._update_status(self.tr("Could not re-read {name}.").format(name=view.label))
+            return
+        self._baseline[view.permissions_file.path] = view.permissions_file.to_toml()
+        if row == self._shown_project_row:
+            # load() fires the change callback, which commits the tab back into
+            # the model. Doing it inside the loading guard keeps that commit off
+            # the freshly read file, or it would restore the discarded edit.
+            self._loading = True
+            try:
+                self.projects_tab.load(view.permissions_file)
+            finally:
+                self._loading = False
+        self._refresh_marks()
+        self._update_status(self.tr("Reloaded {name}.").format(name=view.label))
+
+    def _reload_global(self) -> None:
+        file = self.workspace.global_permissions
+        if file is None:
+            return
+        name = file.path.name
+        pending = self._dirty_names(
+            safe_write.WriteTarget(path=file.path) if self._global_dirty() else None
+        )
+        if not self._confirm_discard(self.tr("Reloading the global file"), pending):
+            return
+        try:
+            self.workspace.global_permissions = permissions.PermissionsFile.load(file.path)
+        except (OSError, ValueError):
+            self._update_status(self.tr("Could not re-read {name}.").format(name=name))
+            return
+        reloaded = self.workspace.global_permissions
+        self._baseline[reloaded.path] = reloaded.to_toml()
+        self.global_tab.load(reloaded)
+        self._refresh_marks()
+        self._update_status(self.tr("Reloaded {name}.").format(name=name))
+
+    def _reload_folders(self) -> None:
+        """Re-read the folder-trust document and the pre-trust roots together."""
+        if not self._confirm_discard(self.tr("Reloading the folder trust files")):
+            return
+        try:
+            self.workspace.trust_document = folders.TrustDocument.load(paths.trusted_folders_path())
+            self.workspace.pre_trust_roots = folders.PreTrustRoots.load(
+                paths.pre_trust_roots_path()
+            )
+        except (OSError, ValueError):
+            self._update_status(self.tr("Could not re-read the folder trust files."))
+            return
+        for store in (self.workspace.trust_document, self.workspace.pre_trust_roots):
+            if store is not None:
+                self._baseline[store.path] = store.to_json()
+        self.folders_tab.load(self.workspace.trust_document, self.workspace.pre_trust_roots)
+        self._refresh_marks()
+        self._update_status(self.tr("Reloaded the folder trust files."))
 
     def _tab_changed(self, index: int) -> None:
         """Refresh tab titles and re-read the global file when it comes into view.
@@ -987,9 +1257,7 @@ class MainWindow(QMainWindow):
         if index != GLOBAL_TAB or self.workspace.global_permissions is None:
             return
         path = self.workspace.global_permissions.path
-        if path in self._baseline and (
-            self.workspace.global_permissions.to_toml() != self._baseline[path]
-        ):
+        if self._global_dirty():
             return
         try:
             self.workspace.global_permissions = permissions.PermissionsFile.load(path)
@@ -1014,9 +1282,17 @@ class MainWindow(QMainWindow):
         # Re-read a project file so a change maki made mid-run shows — but only
         # when the incoming project has no pending edit. Reloading a dirty row
         # would discard the edit (as _populate_row already avoids for sessions).
-        if row not in self._project_targets():
-            view.reload()
-        self.projects_tab.load(view.permissions_file)
+        reloaded = row not in self._project_targets() and view.reload()
+        if reloaded:
+            self._baseline[view.permissions_file.path] = view.permissions_file.to_toml()
+        # load() fires the change callback, which commits the tab into the model.
+        # Inside the loading guard that commit cannot rewrite the file just read
+        # from disk, which would re-dirty a project nobody edited.
+        self._loading = True
+        try:
+            self.projects_tab.load(view.permissions_file)
+        finally:
+            self._loading = False
         self._shown_project_row = row
         self.add_tool_btn.setEnabled(True)
         self.add_mcp_btn.setEnabled(True)
@@ -1056,7 +1332,7 @@ class MainWindow(QMainWindow):
         session = view.session
         if not session.has_rules_line or session.path not in self._baseline:
             return False
-        return session.rules_line() != self._baseline[session.path]
+        return sessions.rule_set(session.rules) != self._baseline[session.path]
 
     def _session_targets(self) -> dict[int, tuple[int, safe_write.WriteTarget]]:
         """Dirty sessions keyed by list row, for saving and row markers.
@@ -1075,7 +1351,7 @@ class MainWindow(QMainWindow):
                 continue
             if session.path not in self._baseline:
                 continue
-            if session.rules_line() != self._baseline[session.path]:
+            if sessions.rule_set(session.rules) != self._baseline[session.path]:
                 dirty[row] = (
                     SESSIONS_TAB,
                     safe_write.WriteTarget(path=session.path, shared=False, writer=session.write),
@@ -1170,7 +1446,7 @@ class MainWindow(QMainWindow):
         """
         for view in self.workspace.sessions:
             if view.session.path == path and view.session.has_rules_line:
-                return view.session.rules_line()
+                return sessions.rule_set(view.session.rules)
         for view in self.workspace.projects:
             if view.permissions_file.path == path:
                 return view.permissions_file.to_toml()
@@ -1284,6 +1560,7 @@ class MainWindow(QMainWindow):
         unlock would compare maki's own rewrite against the old baseline and mark
         a session the user never touched as dirty.
         """
+        LOGGER.info("lock change: rows=%s", sorted(rows))
         sessions_dir = paths.sessions_dir()
         shown = self.sessions_tab._shown
         parked: set[int] = set()
@@ -1299,6 +1576,13 @@ class MainWindow(QMainWindow):
                 if row != shown:
                     view.reload()
                 rebaselined.add(row)
+            LOGGER.info(
+                "lock change: row=%d id=%s locked=%s pending=%s",
+                row,
+                view.session.session_id,
+                now_locked,
+                pending,
+            )
             view.locked = now_locked
         if shown in rows and shown not in parked:
             self.sessions_tab._populate_row(shown)
@@ -1309,18 +1593,25 @@ class MainWindow(QMainWindow):
             self.sessions_tab.set_read_only(True)
         for row in rebaselined:
             self._rebaseline_session(self.workspace.sessions[row])
+        self._log_dirty("lock change")
 
-    def _rebaseline_session(self, view: workspace.SessionView) -> None:
+    def _rebaseline_session(self, view: workspace.SessionView, *, sync: bool = True) -> None:
         """Adopt a reloaded session's rules as its baseline.
 
         A reload that is not a user edit (maki rewriting a session it holds) must
         move the baseline with it, or the next dirty check reads that rewrite as
         an edit. Mirrors the session branch of ``_capture_baselines``.
+
+        {sync} rewrites the row text, which the lock path needs because the lock
+        glyph changed. The populate path passes ``False``: it runs while a row is
+        being opened and its labels are about to be refreshed with the dirty
+        marks, so a plain rewrite here would briefly drop another row's asterisk.
         """
         session = view.session
         if session.has_rules_line:
-            self._baseline[session.path] = session.rules_line()
-        self.sessions_tab.sync_labels()
+            self._baseline[session.path] = sessions.rule_set(session.rules)
+        if sync:
+            self.sessions_tab.sync_labels()
 
     def _park_on_lock(self, row: int) -> None:
         """Report a dirty row that just became locked, keeping the edit.
@@ -1367,6 +1658,67 @@ class MainWindow(QMainWindow):
         locked_paths = {t.path for t in locked}
         return [t for t in targets if t.path not in locked_paths]
 
+    def _review_changes(self) -> changes.ChangeList | None:
+        """What the pending save of the current view would change, or None.
+
+        Built from the file on disk rather than the baseline: a running maki can
+        have rewritten the file since it was loaded, and the dialog must describe
+        the write that is actually about to happen.
+        """
+        index = self.tabs.currentIndex()
+        if index == SESSIONS_TAB:
+            row = self.sessions_tab.list.currentRow()
+            if not 0 <= row < len(self.workspace.sessions):
+                return None
+            session = self.workspace.sessions[row].session
+            if not session.has_rules_line:
+                return None
+            review = changes.session_changes(session.path, session.rules)
+        elif index == PROJECTS_TAB:
+            row = self.projects_selector.currentRow()
+            if not 0 <= row < len(self.workspace.projects):
+                return None
+            file = self.workspace.projects[row].permissions_file
+            review = changes.permissions_changes(file.path, file)
+        elif index == GLOBAL_TAB:
+            file = self.workspace.global_permissions
+            if file is None:
+                return None
+            review = changes.permissions_changes(file.path, file)
+        else:
+            doc = self.workspace.trust_document
+            if doc is None:
+                return None
+            review = changes.folder_changes(doc.path, doc, self.workspace.pre_trust_roots)
+        return review
+
+    def _confirm_save(self, review: changes.ChangeList) -> bool:
+        """Ask before writing, when there is something to ask about.
+
+        A session file is not held open by maki, so writing it needs no
+        explanation beyond the change list and the lock check already done. A
+        shared file cannot be written at all while maki runs, so asking would
+        only be a question whose answer is ignored: it is refused instead.
+        """
+        if all(not target.shared for target in self._current_targets()):
+            return True
+        return SaveDialog(self, review).exec() == QDialog.DialogCode.Accepted
+
+    def _refuse_shared_write(
+        self, targets: list[safe_write.WriteTarget], blocked: list[safe_write.WriteTarget], status
+    ) -> None:
+        """Tell the user a shared file must wait for maki to close."""
+        LOGGER.warning("save blocked, maki running: %s", ", ".join(str(t.path) for t in blocked))
+        names = "\n".join(f"  · {t.path.name}" for t in blocked)
+        QMessageBox.information(
+            self,
+            self.tr("maki is running"),
+            self.tr("Cannot write {names} while maki is running. Close it and retry.").format(
+                names=names
+            ),
+        )
+        self._update_status(self.tr("Not saved: maki is running."))
+
     def _save(self) -> None:
         targets = self._current_targets()
         if not targets:
@@ -1380,34 +1732,20 @@ class MainWindow(QMainWindow):
             self._update_status(self.tr("Nothing saved: file is open in maki."))
             return
 
+        review = self._review_changes()
+        if review is not None and review.empty:
+            self._update_status(self.tr("Nothing to save: this view matches the file on disk."))
+            return
+        if review is not None and not self._confirm_save(review):
+            LOGGER.info("save cancelled at review: %s", review.path)
+            self._update_status(self.tr("Save cancelled; your changes are still pending."))
+            return
+
         status = safe_write.detect_maki()
-        if status.running:
-            blocked = safe_write.blocked_targets(targets, status)
-            names = "\n".join(f"  · {t.path}" for t in blocked) or self.tr(
-                "  (none — only session writes pending)"
-            )
-            detail = self.tr(
-                "maki is running (pid {pids}).\n\n"
-                "Shared files that must wait until maki closes:\n{names}\n\n"
-                "Session files are not held open by maki, so they can be written now, "
-                "but a running session of the same file may re-append on exit.\n\n"
-                "Write the session files only and skip the shared ones?"
-            ).format(pids=", ".join(str(p) for p in status.pids), names=names)
-            choice = QMessageBox.question(
-                self,
-                self.tr("maki is running"),
-                detail,
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-                QMessageBox.StandardButton.Cancel,
-            )
-            if choice != QMessageBox.StandardButton.Yes:
-                return
-            if blocked:
-                blocked_paths = {t.path for t in blocked}
-                targets = [t for t in targets if t.path not in blocked_paths]
-            if not targets:
-                self._update_status(self.tr("No writable targets; close maki and retry."))
-                return
+        blocked = safe_write.blocked_targets(targets, status)
+        if blocked:
+            self._refuse_shared_write(targets, blocked, status)
+            return
 
         saved = {t.path for t in targets}
         try:
