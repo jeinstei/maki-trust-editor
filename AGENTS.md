@@ -46,12 +46,16 @@ Python specifics (the analogue of the root's Rust idioms):
 
 ## Testing
 
-- `QT_QPA_PLATFORM=minimal .venv/bin/python -m pytest -q` — always with a
-  **timeout**. A `QMessageBox` modal under the `minimal` platform hangs forever;
-  any test that can trigger a dialog must stub it or guarantee it does not fire.
+- `.venv/bin/python -m pytest -q` — always with a **timeout**. A `QMessageBox`
+  modal under the `minimal` platform hangs forever; any test that can trigger a
+  dialog must stub it or guarantee it does not fire.
 - `ruff check src tests` and `black --check src tests` must be clean.
-- 158 tests as of last change. Keep them fast (whole suite well under a couple of
-  seconds).
+- 158 tests as of last change, in ~1.2 s. Keep the whole suite well under a
+  couple of seconds.
+- `tmp_path` is redirected to `.pytest-tmp/` by the root `conftest.py` (see
+  *Environment notes*). Do not add a `basetemp` ini key: pytest does not read
+  one (`--basetemp` is a CLI option only), and it only warns `Unknown config
+  option`.
 
 ### Verification pipeline
 
@@ -164,12 +168,21 @@ section does not bring it back.
    cached copy goes stale.
 3. **Widget change signals fire during construction.** Building an editor
    (`set_section`, `add_row`) emits `currentIndexChanged`, which would otherwise
-   be mistaken for a user edit and commit a half-built editor. Two guards:
+   be mistaken for a user edit and commit a half-built store, and would re-dirty
+   a file that was just re-read. The guard belongs **in the tab that loads the
+   widgets**, not at its callers — a caller that forgets it silently corrupts
+   the store, and two did:
    - `ScopeRulesEditor._notify()` is a no-op while `self._loading` is set;
      `set_section` wraps its widget mutations in `_loading`.
-   - `SessionsTab.loading` is True for the duration of `_populate_row`, and
-     `MainWindow._mark_dirty` returns early while `self._loading or
-     self.sessions_tab.loading`.
+   - `PermissionsTab.load()` sets `self._loading` around `_load()`, and its
+     `_notify()` (the `on_change` callback) honours it. Every project/global
+     load path — `_project_selected`, `_reload_project_row`, `_reload_global`,
+     `_tab_changed`, `_populate` — therefore gets the guard for free and none of
+     them wrap `load()` themselves.
+   - `SessionsTab._populate_row()` does the same around `_fill_row()`; its
+     `_notify()` honours it, so `MainWindow._mark_dirty` no longer inspects
+     `sessions_tab.loading`. `_mark_dirty` keeps only the window's own
+     `self._loading` gate.
 4. **Dirty = model vs. baseline, per file.** `_capture_baselines()` records each
    store's canonical serialization at load. A store with no baseline (missing or
    empty file) is never dirty. Sessions are canonicalized before hashing the
@@ -256,10 +269,11 @@ edit pending.
 **A reload must not re-dirty itself.** `projects_tab.load()` / `global_tab.load()`
 fire the change callback, which commits the tab into the model — if that runs
 after `view.reload()`, the stale widget state overwrites the file just read and
-the reload is undone. `_reload_project_row` and `_project_selected` therefore
-wrap the `load()` in `self._loading = True` and advance the baseline from the
-freshly read file. This bit twice: reloading a project left it dirty, and merely
-*selecting* projects marked them all dirty.
+the reload is undone. The guard is `PermissionsTab.load()`'s own `_loading`
+(invariant 3), so no reload path needs to wrap the call; each one only advances
+the baseline from the freshly read file. This bit twice before the guard moved
+into the tab: reloading a project left it dirty, and merely *selecting* projects
+marked them all dirty.
 
 ## Session liveness (locks)
 
@@ -423,11 +437,18 @@ toggling **Debug logging** (`app.set_debug_logging`).
 - The app writes its own state under the platform state dir (see `paths.py`);
   some environments need an explicit write grant there before the app, or the
   test suite, can create it.
-- `/tmp` (or the system temp dir) may or may not be usable depending on the
-  distribution and sandbox: it is sometimes not executable (and files written
-  there may not be readable), not always. Keep scratch files inside the project
-  directory and delete them when done.
-- A restricted sandbox may also break `git` (a version control operation fails
-  outright). If so, recover by reading files rather than `git checkout`.
-- Prefer `main`/feature branches, but never assume a network-dependent or VCS
-  command will behave the same everywhere; verify before relying on it.
+- **`/tmp` can be unusable in a way that looks like it works.** A sandbox may
+  allow an ordinary write but refuse `tempfile`'s random `O_CREAT|O_EXCL` probe
+  (`touch /tmp/x` succeeds, `tempfile` still falls through to the cwd). The
+  symptom is a `tmp********/` directory appearing in the project root after every
+  pytest run. Root `conftest.py` sets `basetemp` to `.pytest-tmp/` so the litter
+  is contained either way. Note `basetemp` is **not** a pytest ini option —
+  `pyproject.toml` rejects it with `Unknown config option` and pytest ignores it.
+- Keep scratch files inside the project directory and delete them when done.
+- A restricted sandbox may break `git`; recover by reading files rather than
+  `git checkout`.
+- **A Qt app can die at interpreter shutdown** with SIGSEGV/SIGABRT
+  (`malloc_consolidate`, no Python frame) once PySide6 starts tearing down. No
+  `try`/`except` or decorator catches it; that is why the suite's exit code is
+  not a reliable signal on its own — check the `N passed` line. Do not add a
+  `pytest_sessionfinish` hook that pumps events to dodge it: it hangs.

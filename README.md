@@ -67,13 +67,18 @@ There are four tabs along the top and a **Save** button at the bottom:
 - **Folders** — the folder-trust list and the pre-trust snapshot.
 - **Global** — your user-wide rules.
 
-**Save** writes the file for the tab you are on (see *Saving* below).
+**Save** writes the file for the tab you are on (see *Saving* below). The
+**+ Tool section** and **+ MCP server** buttons belong to the rules area itself,
+so they appear on both **Projects** and **Global**; the footer holds only
+**Save** and the reload buttons.
 
 **Reloading:** **Reload file** re-reads just the file on the current tab, and
 **Reload all** re-reads everything. Both ask before throwing away unsaved changes
-and name the files at risk.
+and name the files at risk. Only **Reload file** has a shortcut — discarding
+every file at once stays a deliberate click.
 
-**Keyboard:** Ctrl+S saves, Ctrl+R re-reads the file on the current tab.
+**Keyboard:** Ctrl+S saves, Ctrl+R re-reads the file on the current tab (same as
+**Reload file**).
 
 ## Editing rules
 
@@ -264,9 +269,9 @@ separate from maki's:
 - macOS: `~/Library/Application Support/maki-trust-editor/maki-trust-editor.log`
 - Windows: `%LOCALAPPDATA%\maki-trust-editor\maki-trust-editor.log`
 
-It records the session locks at startup, every save and its result, and any file
-that failed to load, including uncaught crashes — useful because a windowed app
-has no console.
+It records the session locks at startup, every save and its result, a skipped
+open session, a refused shared write, and any file that failed to load, including
+uncaught crashes — useful because a windowed app has no console.
 
 If you need more detail for a bug report, turn on **Debug logging**: right-click
 anywhere in the window and tick it (or start the app with
@@ -279,6 +284,7 @@ immediately.
 ```
 run_app.sh         launcher: existing venv, else ephemeral uv env
 run_app.py         launcher: any Python, adds src/ to the path itself
+conftest.py        keeps pytest's tmp_path inside .pytest-tmp/
 src/maki_trust_editor/
   paths.py         locate maki's stores (cross-platform)
   permissions.py   parse/serialize permissions.toml
@@ -291,5 +297,11 @@ src/maki_trust_editor/
   window.py        the main window, tabs, and folder trust dialog
   app.py           entry point, logging, Ctrl-C handling
 ```
+
+Tests live in `tests/` and run with `.venv/bin/python -m pytest -q`; there are
+158, in about a second. `conftest.py` points pytest's `tmp_path` at
+`.pytest-tmp/` because on a machine whose system temp dir refuses a random-name
+create, `tempfile` falls back to the current directory and litters the project
+root. `.pytest-tmp/` is gitignored and cleared between runs.
 
 See `AGENTS.md` for the internal design, invariants and gotchas.
