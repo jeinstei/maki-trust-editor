@@ -154,6 +154,60 @@ dead grey box — the add buttons work without saving an empty file first. The
 hint keys off **zero sections**, not off the filter, so a filter that hides every
 section does not bring it back.
 
+### Removing a section
+
+`ScopedHolder.add_editor(label, editor, on_remove)` puts a **Remove section**
+button in the section heading and calls `on_remove(editor)` when it is clicked;
+`remove_editor(editor)` then drops that box. Without `on_remove` the button is
+created **disabled** (a holder that cannot remove anything refuses to offer it).
+
+**Removal destroys the widgets; it does not hide them.** `remove_editor` runs
+`removeWidget` + `setParent(None)` + `deleteLater()`, so the box and — as its
+children — the editor and the button are deleted. A hidden box would stay alive
+and still be reachable, which is the bug this must not regress into. Tests in
+`test_remove_section.py` assert the C++ objects raise `RuntimeError` afterwards.
+
+**No `id()` keyed side tables.** The first version mapped `id(editor)` to the
+button. That is wrong twice over: a stale key outlives an editor removed by
+another path (`clear_editors`), and CPython can reuse an address, so a stale key
+silently rebinds a *new* section to a *dead* button. The button is a child of the
+box, so `box.findChild(QPushButton, REMOVE_SECTION_BUTTON)` finds it inside that
+box only, and nothing has to be kept in sync.
+
+**The model must lose the section too.** `collect()` rebuilds the file from
+`_editors`, so a section gone from the widget but still in that list is written
+straight back. `PermissionsTab._remove_section` drops the tuple *and* the entry
+in `_file.tools`/`_file.mcp`; `SessionsTab._remove_group` drops its tuple.
+
+**A populated section asks first** (`_confirm_remove_section`), an empty one does
+not. "Empty" is `ScopeRulesEditor.is_empty()`: no scope rows, no all-scope
+effect, no default, no preserved keys — anything carried is content, so the
+prompt fires if it is there.
+
+**Removing the last rule does not remove the section.** They stay separate
+actions: a section can hold a default or preserved keys unrelated to its scopes,
+and deleting rules should not silently discard those. The editor mirrors the
+file, so a bare `[bash]` on disk opens as an empty-looking section that stays put
+until explicitly removed. Note a bare `[bash]` is **inert** to maki
+(`push_rules` skips a section whose `allow` is `None`) yet not free: it is
+serialized and counts as a difference, so the section header is reported
+(`+ [grep]`) rather than written silently.
+
+**`changes._section_changes` compares sections, not just their scopes.** Scopes
+alone missed every section-level write: a section appearing or disappearing, a
+per-section `default`, and preserved unknown keys. The defect was **in the
+report, never in the write**: a section carrying only a `default` is a valid and
+maki-honoured instruction (`maki-config/src/lib.rs:2410`, `:2427` — an unscoped
+section's `default` becomes the tool's fallback), so writing it was always right.
+What went wrong is that the change list came back empty, and `_save` reads an
+empty list as "this view matches the file on disk": when such a section was the
+*only* change, the save returned without writing and the status line claimed
+nothing had changed; otherwise it wrote the section unannounced. A removed
+section reports itself *and* each rule it held (routed through the same diff with
+an empty new side). Tested in `test_changes_sections.py`; four mutants pin each
+branch.
+
+
 ## Invariants (do not break)
 
 1. **`_changed_stores()` is a pure read.** It must not mutate any model. It used

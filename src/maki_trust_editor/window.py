@@ -112,6 +112,28 @@ def _assign_all_effect(rules: ToolRules | McpServerRules, effect: str | None) ->
     rules.deny_all = effect == "deny"
 
 
+def _confirm_remove_section(parent, section: str, editor: ScopeRulesEditor) -> bool:
+    """Ask before dropping a section that still holds rules.
+
+    An empty section disappears without a question — there is nothing to lose
+    and the user just deleted everything in it. A populated one is a different
+    matter: the button sits beside a live rule set, so a misclick would discard
+    it silently. Returns True when the removal may proceed.
+    """
+    if editor.is_empty():
+        return True
+    answer = QMessageBox.question(
+        parent,
+        parent.tr("Remove section"),
+        parent.tr("Section {section} still contains rules. Remove it and everything in it?").format(
+            section=section
+        ),
+        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+        QMessageBox.StandardButton.Cancel,
+    )
+    return answer == QMessageBox.StandardButton.Yes
+
+
 def _lock_prefix(locked: bool) -> str:
     """A session-open marker with a trailing space, or an empty string.
 
@@ -198,7 +220,7 @@ class PermissionsTab(QWidget):
             editor.add_row(scope, "deny")
         for scope in rules.allow:
             editor.add_row(scope, "allow")
-        self.scoped.add_editor(f"[{name}]", editor)
+        self.scoped.add_editor(f"[{name}]", editor, lambda held: self._remove_section(held))
         self._editors.append((name, editor, False))
 
     def _add_mcp(self, server: str, rules: McpServerRules) -> None:
@@ -209,8 +231,27 @@ class PermissionsTab(QWidget):
             editor.add_row(scope, "deny")
         for scope in rules.allow:
             editor.add_row(scope, "allow")
-        self.scoped.add_editor(f"[mcp.{server}]", editor)
+        self.scoped.add_editor(f"[mcp.{server}]", editor, lambda held: self._remove_section(held))
         self._editors.append((server, editor, True))
+
+    def _remove_section(self, editor: ScopeRulesEditor) -> None:
+        """Drop one tool or MCP section from the editor and from the model.
+
+        The model dict is what ``collect()`` rebuilds the file from, and it
+        iterates ``_editors``; both must lose the entry or a save would rewrite
+        a section the user removed.
+        """
+        entry = next((e for e in self._editors if e[1] is editor), None)
+        if entry is None:
+            return
+        if not _confirm_remove_section(self, entry[0], editor):
+            return
+        name, _, is_mcp = entry
+        self._editors.remove(entry)
+        self.scoped.remove_editor(editor)
+        if self._file is not None:
+            (self._file.mcp if is_mcp else self._file.tools).pop(name, None)
+        self._notify()
 
     def set_file(self, file: permissions.PermissionsFile | None) -> None:
         """Track which file the tab edits, and whether adding is possible."""
@@ -459,7 +500,7 @@ class SessionsTab(QWidget):
             editor.set_section(None, group.all_effect)
             for scope, effect in group.scopes:
                 editor.add_row(scope, effect)
-            self.scoped.add_editor(group.tool, editor)
+            self.scoped.add_editor(group.tool, editor, lambda held: self._remove_group(held))
             self._editors.append((group.tool, editor))
         # A session maki holds open is shown but not editable: any write would
         # race with maki re-appending to the same file on exit.
@@ -564,8 +605,23 @@ class SessionsTab(QWidget):
             return
         editor = ScopeRulesEditor(self._notify, name)
         editor.add_row("", EFFECT_ALLOW)
-        self.scoped.add_editor(name, editor)
+        self.scoped.add_editor(name, editor, lambda held: self._remove_group(held))
         self._editors.append((name, editor))
+
+    def _remove_group(self, editor: ScopeRulesEditor) -> None:
+        """Drop one tool group from the shown session's editor and model.
+
+        ``collect()`` rebuilds the session's rules from ``_editors``, so the
+        entry must go or a save would keep rewriting the removed group.
+        """
+        entry = next((e for e in self._editors if e[1] is editor), None)
+        if entry is None:
+            return
+        if not _confirm_remove_section(self, entry[0], editor):
+            return
+        self._editors.remove(entry)
+        self.scoped.remove_editor(editor)
+        self._notify()
 
     def collect(self) -> list:
         rules: list[sessions.SessionRule] = []

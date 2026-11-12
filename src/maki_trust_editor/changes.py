@@ -121,10 +121,44 @@ def _scope_pairs(allow: list[str], deny: list[str]) -> Counter[tuple[str, str]]:
 
 
 def _section_changes(
-    name: str, old: permissions.ToolRules | None, new: permissions.ToolRules
+    name: str, old: permissions.ToolRules | None, new: permissions.ToolRules | None
+) -> list[Change]:
+    """Rules and settings a write changes in one section.
+
+    Scopes are not the whole story: a section can appear or vanish on its own,
+    carry a ``default`` that decides every scope it does not list, and keep
+    unknown keys verbatim. Diffing scopes alone reported none of those, so a
+    section added with a default, or removed wholesale, was written without the
+    dialog naming it — and a save whose only change was such a section read as
+    "nothing to save".
+    """
+    changes: list[Change] = []
+    if old is None:
+        # A section arriving with a default says so on its own line, or the
+        # reviewer cannot tell a bare header from one that sets a fallback.
+        suffix = "" if new.default is None else f"  default {new.default}"
+        changes.append(Change(ADDED, f"[{name}]{suffix}"))
+    elif new is None:
+        changes.append(Change(REMOVED, f"[{name}]"))
+    elif old.default != new.default:
+        changes.append(Change(CHANGED, f"[{name}] default  {new.default}  (was {old.default})"))
+    old_unknown = old.unknown if old is not None else {}
+    new_unknown = new.unknown if new is not None else {}
+    for key in sorted(set(new_unknown) | set(old_unknown)):
+        if key not in new_unknown:
+            changes.append(Change(REMOVED, f"[{name}] {key}"))
+        elif key not in old_unknown:
+            changes.append(Change(ADDED, f"[{name}] {key}"))
+        elif old_unknown[key] != new_unknown[key]:
+            changes.append(Change(CHANGED, f"[{name}] {key}  {new_unknown[key]}"))
+    return changes + _scope_changes(name, old, new)
+
+
+def _scope_changes(
+    name: str, old: permissions.ToolRules | None, new: permissions.ToolRules | None
 ) -> list[Change]:
     old_pairs = _scope_pairs(old.allow, old.deny) if old is not None else Counter()
-    new_pairs = _scope_pairs(new.allow, new.deny)
+    new_pairs = _scope_pairs(new.allow, new.deny) if new is not None else Counter()
     old_by_scope = {scope: effect for scope, effect in old_pairs}
     new_by_scope = {scope: effect for scope, effect in new_pairs}
     changes: list[Change] = []
@@ -151,11 +185,9 @@ def _permissions_changes(
     if old.default != new.default:
         changes.append(Change(CHANGED, f"(file default)  {new.default}  (was {old.default})"))
     for name in sorted(set(new.tools) | set(old.tools)):
-        if name in new.tools:
-            changes.extend(_section_changes(name, old.tools.get(name), new.tools[name]))
+        changes.extend(_section_changes(name, old.tools.get(name), new.tools.get(name)))
     for server in sorted(set(new.mcp) | set(old.mcp)):
-        if server in new.mcp:
-            changes.extend(_section_changes(f"mcp.{server}", old.mcp.get(server), new.mcp[server]))
+        changes.extend(_section_changes(f"mcp.{server}", old.mcp.get(server), new.mcp.get(server)))
     return ChangeList(path=path, changes=changes)
 
 

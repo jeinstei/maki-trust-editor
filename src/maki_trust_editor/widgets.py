@@ -31,6 +31,7 @@ from . import sessions
 from .permissions import EFFECT_ALLOW, EFFECT_DENY, EFFECTS
 
 WILDCARDS = "*?"
+REMOVE_SECTION_BUTTON = "removeSectionButton"
 
 
 def compile_filter(pattern: str) -> re.Pattern[str] | None:
@@ -166,6 +167,7 @@ class ScopeRulesEditor(QWidget):
         # stays visible and choosing a real effect replaces it instead of losing
         # it. Only consulted while the box sits on the invalid sentinel.
         self._invalid_default: str | None = None
+        self._unknown: dict = {}
         self._loading = False
 
         outer = QVBoxLayout(self)
@@ -208,8 +210,18 @@ class ScopeRulesEditor(QWidget):
         self._unknown_label.hide()
         outer.addWidget(self._unknown_label)
 
+    def is_empty(self) -> bool:
+        """Whether this section holds no rule and no setting whatsoever.
+
+        Drives the removal prompt: an empty section can go without a question,
+        but a populated one must not vanish by a stray click. Preserved keys
+        count as content — they are discarded with the section.
+        """
+        return not (self.rows() or self.all_effect() or self.default() or self._unknown)
+
     def set_unknown(self, keys: dict) -> None:
         """Show unmodeled keys preserved in this section, or hide when none."""
+        self._unknown = dict(keys)
         if not keys:
             self._unknown_label.hide()
             return
@@ -394,19 +406,41 @@ class ScopedHolder(QWidget):
         self._scroll.setWidget(self._inner)
         layout.addWidget(self._scroll)
 
-    def add_editor(self, label: str, editor: ScopeRulesEditor) -> None:
+    def add_editor(self, label: str, editor: ScopeRulesEditor, on_remove=None) -> None:
         box = QFrame()
         box.setFrameShape(QFrame.Shape.StyledPanel)
         box_layout = QVBoxLayout(box)
         box_layout.setContentsMargins(6, 6, 6, 6)
+        heading = QHBoxLayout()
         name = QLabel(label)
         name.setStyleSheet("font-weight: 600;")
-        box_layout.addWidget(name)
+        heading.addWidget(name)
+        heading.addStretch(1)
+        remove = QPushButton(self.tr("Remove section"))
+        remove.setObjectName(REMOVE_SECTION_BUTTON)
+        remove.setEnabled(on_remove is not None and not self._read_only)
+        remove.clicked.connect(lambda: on_remove(editor))
+        heading.addWidget(remove)
+        box_layout.addLayout(heading)
         box_layout.addWidget(editor)
         self._inner_layout.insertWidget(self._inner_layout.indexOf(self._stretch), box)
         self._sections.append((label, box, editor))
         self._empty_hint.setVisible(False)
         self._rebuild_section_box()
+
+    def remove_editor(self, editor: ScopeRulesEditor) -> None:
+        """Drop one section box, by identity (see ``clear_editors``)."""
+        for entry in list(self._sections):
+            _, box, held = entry
+            if held is not editor:
+                continue
+            self._sections.remove(entry)
+            self._inner_layout.removeWidget(box)
+            box.setParent(None)
+            box.deleteLater()
+            self._empty_hint.setVisible(bool(self._empty_hint.text()))
+            self._rebuild_section_box()
+            return
 
     def clear_editors(self) -> None:
         # Remove exactly the section boxes, by identity. Indexing the layout
@@ -424,8 +458,11 @@ class ScopedHolder(QWidget):
     def set_read_only(self, read_only: bool) -> None:
         """Make every section uneditable (used for a session maki holds open)."""
         self._read_only = read_only
-        for _, _, editor in self._sections:
+        for _, box, editor in self._sections:
             editor.set_read_only(read_only)
+            button = box.findChild(QPushButton, REMOVE_SECTION_BUTTON)
+            if button is not None:
+                button.setEnabled(not read_only)
 
     def is_read_only(self) -> bool:
         return self._read_only

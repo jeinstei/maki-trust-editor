@@ -100,6 +100,15 @@ When a project or global file is empty (or does not exist yet) the rules area
 shows a hint pointing at those add buttons, so you can start straight away — you
 do not need to save an empty file first.
 
+**Removing a section.** Each section has a **Remove section** button in its
+heading. It removes the section and everything in it; if the section still holds
+rules, the app asks first, and an empty section goes without a question. Removing
+the last rule and removing the section are deliberately separate actions —
+deleting rules never takes the section with it, because a section can hold a
+default or preserved keys that have nothing to do with its scopes. A file that
+already contains a header with no rules therefore opens showing that section,
+and it stays exactly as it is until you remove it.
+
 **Repeated rules.** A rule is identified by its tool and its scope. If two rows
 in one section end up with the same tool and scope, the row is annotated:
 *duplicate rule for this scope* when they agree, or *conflicting effects: allow,
@@ -140,7 +149,13 @@ changes before writing them:
 + bash  make *  deny                    ← added
 - read  /etc/**  allow                  ← removed
 ~ bash  git *  deny  (was allow)        ← effect changed
++ [grep]  default deny                  ← section added
+- [mcp.github]                          ← section removed
 ```
+
+Sections are listed too, not just rules: a section can appear, disappear, carry a
+`default` (the fallback for every scope it does not list), or keep preserved keys,
+and any of those is a real change to the file even when no rule changed.
 
 Pick **Write** to save, or **Cancel** to back out — cancelling writes nothing and
 your edits stay exactly as they were. This catches a change you made in a section
