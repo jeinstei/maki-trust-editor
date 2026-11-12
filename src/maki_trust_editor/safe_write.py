@@ -171,15 +171,11 @@ def _real_target(path: Path) -> Path:
     return path
 
 
-def backup_path(path: Path) -> Path:
-    return path.with_name(path.name + BACKUP_SUFFIX)
-
-
 def make_backup(path: Path) -> Path | None:
     real = _real_target(path)
     if not real.is_file():
         return None
-    target = backup_path(real)
+    target = real.with_name(real.name + BACKUP_SUFFIX)
     shutil.copy2(real, target)
     return target
 

@@ -50,7 +50,7 @@ Python specifics (the analogue of the root's Rust idioms):
   **timeout**. A `QMessageBox` modal under the `minimal` platform hangs forever;
   any test that can trigger a dialog must stub it or guarantee it does not fire.
 - `ruff check src tests` and `black --check src tests` must be clean.
-- 131 tests as of last change. Keep them fast (whole suite well under a couple of
+- 158 tests as of last change. Keep them fast (whole suite well under a couple of
   seconds).
 
 ### Verification pipeline
@@ -93,16 +93,17 @@ Rust-style layering, one concern per module under `src/maki_trust_editor/`:
 | `folders.py` | Read/rewrite `trusted-folders.json` and `pre-trust-roots.json` |
 | `workspace.py` | Gather every store into view models; only module that reads files for the UI |
 | `safe_write.py` | Backup + atomic write + maki-running guard |
+| `changes.py` | What a save will change, diffed against the file on disk |
+| `widgets.py` | Scope editor widgets, filter, section picker, conflict notes |
+| `window.py` | Main window, tabs, selection, save/reload, dialogs |
+| `i18n.py` | Locale detection + Qt translator install; loads `.qm` catalogs |
+| `app.py` | Entry point, logging, Ctrl-C handling |
 
 Writes follow a symlink to its target (`_real_target`): `os.replace` on the link
 itself would replace it with a regular file, so backup and write both land on
 `path.resolve()`. An existing target is backed up beside the real file
 (`<name>.bak`). `psutil` is an **optional** extra; `detect_maki` falls back to
 native `pgrep`/`tasklist` when it is absent.
-| `widgets.py` | Scope editor widgets, filter, section picker |
-| `window.py` | Main window, tabs, session/project selection, save logic |
-| `i18n.py` | Locale detection + Qt translator install; loads `.qm` catalogs |
-| `app.py` | Entry point, logging, Ctrl-C handling |
 
 ### Data model
 
@@ -126,8 +127,15 @@ native `pgrep`/`tasklist` when it is absent.
   of seconds (the id is millisecond-precise, the header whole seconds).
 - `ToolGroup.group(rules)` buckets rules by tool and **sorts tools**; within a
   tool, scope rules come first and the scope-less rule last. `to_rules()`
-  reconstructs. `sessions.canonical_rules(rules)` is the flattened canonical
-  form — the exact order a save writes.
+  reconstructs, and it is the order a save writes.
+- `sessions.rule_set(rules)` is a `Counter` of `(tool, scope, effect)`: the
+  comparison used for "did the rules change". It is a multiset on purpose —
+  order and JSON spacing must not count as an edit, but a duplicated rule must.
+  `rules_line()` is for *writing* only; comparing serialized lines made every
+  reload look like an edit.
+- `sessions.scope_conflicts(rules)` returns the `(tool, scope)` keys held more
+  than once. It is derived on demand, never stored, and drives the per-row
+  warning in the editor.
 
 ### Empty rules area
 
@@ -175,8 +183,12 @@ section does not bring it back.
    `_commit_tab(PROJECTS_TAB)` must park the visible editor in
    `_shown_project_row`, not `projects_selector.currentRow()` — the signal fires
    after the row already changed, so `currentRow()` is the incoming row and would
-   write the editor into the wrong project. `_reload()` prompts via
-   `_confirm_discard()` before discarding unsaved edits, like `closeEvent`.
+   write the editor into the wrong project. Every reload prompt goes through
+   `_confirm_discard(action, names)`, which **names the files at risk**; a bare
+   "you have unsaved changes" cannot tell a reload of the file being edited from
+   an unrelated edit elsewhere. `_reload` (Reload all) re-reads every store;
+   `_reload_current` (`Ctrl+R`) re-reads only the active tab's file(s). Only the
+   latter has a shortcut: the riskier action stays a deliberate click.
 6. **Append-only session writes.** A session write rewrites only the final meta
    line; everything before it is streamed unchanged.
 7. **Locked sessions are read-only, never saved, and never dirty.**
@@ -198,7 +210,7 @@ section does not bring it back.
   (`_mark_dirty` → `_commit_current()`), so leaving a session/project never loses
   them and switching needs no discard prompt. `_project_selected` and
   `_tab_changed` commit the outgoing selection first. Only the destructive
-  actions prompt: `closeEvent` and `_reload()` (`_confirm_discard`).
+  actions prompt: `closeEvent` and every reload (`_confirm_discard`).
 - **Dirty markers.** `_refresh_marks()` marks tab titles and list rows with
   `DIRTY_MARK` (` *`). Row labels are stored (`SessionsTab._labels`,
   `MainWindow._project_labels`) so the mark can be rebuilt without re-deriving
@@ -212,11 +224,42 @@ section does not bring it back.
 1. `_save()` → `_current_targets()` (commits the current editor, picks the
    active tab's target).
 2. `_drop_locked_sessions()` — remove any session a running maki holds open.
-3. If a maki process is running: shared targets are blocked (Linux checks
-   `/proc/<pid>/fd`; other platforms block all shared files), and the user is
-   asked whether to write the session files only.
-4. `safe_write.write_targets()` — backup, then atomic replace or the session writer.
-5. Advance only the saved files' baselines; `_refresh_marks()`.
+3. `_review_changes()` builds the change list from the file **on disk** (not the
+   baseline, which a running maki may have outdated) and reports it. A session
+   save skips the dialog: it is not shared and the lock check already covers it.
+   Any other target opens `SaveDialog` (Write / Cancel); Cancel writes nothing
+   and leaves the edit pending. An empty list means the view already matches
+   disk, so nothing is written and no dialog appears.
+4. `safe_write.detect_maki()` then `blocked_targets()`: a shared file a running
+   maki holds open is **refused** (`_refuse_shared_write`), not offered as a
+   choice. Session targets are never blocked here.
+5. `safe_write.write_targets()` — backup, then atomic replace or the session writer.
+6. Advance only the saved files' baselines; `_refresh_marks()`.
+
+## Reload
+
+Two buttons, one rule: **nothing is re-read over an unsaved edit without asking.**
+
+- **Reload all** (`_reload`) re-reads every store via
+  `workspace.load_workspace()` + `_populate()`. No shortcut: discarding every
+  store's edits is the riskier action, so it stays a deliberate click.
+- **Reload file** (`_reload_current`, `Ctrl+R`) re-reads only what the active tab
+  shows:
+  `_reload_session_row`, `_reload_project_row`, `_reload_global`,
+  `_reload_folders` (both folder files, matching how Save writes them). It
+  follows the **selection**, not whatever was open at load.
+
+Both call `_confirm_discard(action, names)`; `_dirty_names()` answers "is this
+specific file pending?" so a clean file reloads silently. Cancelling leaves every
+edit pending.
+
+**A reload must not re-dirty itself.** `projects_tab.load()` / `global_tab.load()`
+fire the change callback, which commits the tab into the model — if that runs
+after `view.reload()`, the stale widget state overwrites the file just read and
+the reload is undone. `_reload_project_row` and `_project_selected` therefore
+wrap the `load()` in `self._loading = True` and advance the baseline from the
+freshly read file. This bit twice: reloading a project left it dirty, and merely
+*selecting* projects marked them all dirty.
 
 ## Session liveness (locks)
 
@@ -243,6 +286,31 @@ section does not bring it back.
   — **not `inFont`**, which takes a single UTF-16 `QChar` and raises on astral
   characters such as the padlock.
 
+## Save review and rule conflicts
+
+**`changes.py` diffs the file on disk, not the baseline.** The baseline is what
+the app *loaded*, which a running maki can have moved since; the dialog has to
+describe the write that is about to happen. Every entry point re-reads the target
+(`Session.load`, `PermissionsFile.load`, `TrustDocument.load`) and compares.
+Markers: `+` added, `-` removed, `~` effect flipped (`deny  (was allow)`).
+
+**The comparison is a multiset** (`sessions.rule_set`), matching the dirty check,
+so the dialog can never say "nothing to save" while the window says dirty.
+Keying on `(tool, scope)` alone would collapse duplicates and do exactly that.
+One known imprecision: a key that both flips effect *and* gains or loses a copy
+reports only the flip.
+
+**Rule identity is `(tool, scope)`.** Two rows resolving to the same pair are
+flagged in the editor, never blocked — a file may already hold them, and
+rewriting the user's intent is worse than showing it. `scope_conflicts()` returns
+the repeated keys; `ScopeRulesEditor._mark_conflicts()` renders a note per row
+(`duplicate rule for this scope`, `conflicting effects: allow, deny`). It runs on
+every mutation **and** in `add_row`, so a file loaded with a conflict shows it
+before the user touches anything. `ScopeRulesEditor` therefore takes the section
+name (`ScopeRulesEditor(on_change, tool)`); the holder's label cannot serve,
+since it is decorated for display (`[bash]`, `[mcp.github]`) in the TOML tabs but
+raw in sessions.
+
 ## gotchas
 
 - **The `READ ONLY` reasoning is subtle:** a locked session shows all its rules
@@ -260,7 +328,7 @@ section does not bring it back.
   reload it, dropping the edit. `_apply_lock_changes` therefore calls
   `SessionsTab.set_read_only(True)` in place for a parked shown row instead of
   re-populating it. The dirty test it uses is `_session_pending_edit`, a
-  **lock-agnostic** check (model's `rules_line()` vs `_baseline`) — not
+  **lock-agnostic** check (model's `rule_set()` vs `_baseline`) — not
   `_session_row_dirty`, which excludes locked rows and would read a parked row as
   clean, so the parked edit would be silently re-baselined and lose its mark.
 - **Unlock re-baselines, or it invents a spurious dirty.** When a lock vanishes
@@ -268,13 +336,15 @@ section does not bring it back.
   the file while it held the lock. The baseline was captured at load, so that
   reload differs from it and marks a session the user never touched as dirty.
   `_rebaseline_session` therefore advances `_baseline[path]` to the freshly
-  reloaded `rules_line()` whenever the row is clean (and `has_rules_line`).
+  reloaded rule set whenever the row is clean (and `has_rules_line`).
   Tests: `test_unlock_after_maki_rewrites_is_not_dirty` (the bug) and
   `test_parked_edit_survives_unlock_and_stays_dirty` (the parked edit must *not*
   be re-baselined).
-- **`SessionView.reload()` canonicalizes rules** via `sessions.canonical_rules()`.
-  Do not remove that: a freshly reloaded non-canonical-order session would look
-  dirty.
+- **The dirty check compares `sessions.rule_set()`, not serialized lines.** maki
+  writes its own rule order and compact JSON separators; re-serializing from the
+  parsed model reproduces neither, so a line comparison marked every reloaded
+  session dirty. Comparing a multiset of `(tool, scope, effect)` is immune to
+  both, and still notices a duplicated rule.
 - **Widget identity:** `SessionsTab._editors` is `[(tool_name, ScopeRulesEditor)]`;
   `collect()` rebuilds `SessionRule`s from it. Renaming a group rebuilds all
   rules, so keep `ToolGroup` as the single place that defines rule order.
@@ -338,10 +408,15 @@ section does not bring it back.
 
 `app.setup_logging()` installs a `RotatingFileHandler` (1 MB × 3) at
 `paths.log_path()`, in **our** state dir (`<state-root>/maki-trust-editor`), never
-maki's. `sys.excepthook` writes uncaught exceptions. `window.LOGGER` records the
-startup lock state, every save (targets + result), the open-session skip, and any
-load problem. Logging is best-effort: an `OSError` means the app runs without a
-log.
+maki's. `sys.excepthook` writes uncaught exceptions. At `INFO` the log carries
+what a user would report: startup lock state, each save and its result, a skipped
+open session, a refused shared write, and any load problem. Logging is
+best-effort: an `OSError` means the app runs without a log.
+
+Per-change tracing (which rows are dirty after a lock flip, each reload, the
+save target count) is `DEBUG`, which `INFO` suppresses. Enable it for a run with
+`MAKI_TRUST_EDITOR_DEBUG=1`, or at any time by right-clicking the window and
+toggling **Debug logging** (`app.set_debug_logging`).
 
 ## Environment notes
 

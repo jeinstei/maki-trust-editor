@@ -19,10 +19,11 @@ import logging
 import re
 import time
 
-from qtpy.QtCore import Qt, QTimer
+from qtpy.QtCore import QCoreApplication, Qt, QTimer
 from qtpy.QtGui import QFontMetrics, QKeySequence, QPalette, QShortcut
 from qtpy.QtWidgets import (
     QApplication,
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
@@ -54,6 +55,25 @@ MAKI_STATUS_TTL = 2.0
 # enough that the process-table scan is negligible while idle.
 LIVENESS_POLL_MS = 2000
 TOOL_NAME_RE = re.compile(r"^\w[\w-]*$")
+# maki's built-in native tools (maki-agent/src/tools/mod.rs), offered as
+# suggestions when adding a group. Typing any other valid name still works: a
+# rule for a name maki does not know simply never matches, and a project can
+# carry tools this build has never heard of.
+BUILTIN_TOOLS = (
+    "bash",
+    "code_execution",
+    "edit",
+    "glob",
+    "grep",
+    "multiedit",
+    "question",
+    "read",
+    "task",
+    "todo_write",
+    "view_image",
+    "write",
+)
+
 DIRTY_MARK = " *"
 # The id a session was named by embeds a UUIDv7 timestamp in milliseconds while
 # the header records ``created_at`` in whole seconds, so the two differ by under
@@ -115,6 +135,7 @@ class PermissionsTab(QWidget):
         super().__init__()
         self._empty_hint = empty_hint
         self._on_change = on_change or (lambda: None)
+        self._loading = False
         self._file: permissions.PermissionsFile | None = None
         self._rules_hint = self.tr(
             "No rules yet — use the + buttons below to add a tool or MCP server."
@@ -131,9 +152,27 @@ class PermissionsTab(QWidget):
         self.scoped = ScopedHolder("Rules", self._rules_hint)
         layout.addWidget(self.scoped)
         self._editors: list[tuple[str, ScopeRulesEditor, bool]] = []
+        bar = QHBoxLayout()
+        self.add_tool_btn = QPushButton(self.tr("+ Tool section"))
+        self.add_mcp_btn = QPushButton(self.tr("+ MCP server"))
+        bar.addWidget(self.add_tool_btn)
+        bar.addWidget(self.add_mcp_btn)
+        bar.addStretch(1)
+        layout.addLayout(bar)
+        self.set_file(None)
 
     def load(self, file: permissions.PermissionsFile | None) -> None:
-        self._file = file
+        # Building editors emits the change signal, which would look like an edit
+        # and commit a half-built store. Guarding here rather than at every caller
+        # is what keeps the three load paths identical.
+        self._loading = True
+        try:
+            self._load(file)
+        finally:
+            self._loading = False
+
+    def _load(self, file: permissions.PermissionsFile | None) -> None:
+        self.set_file(file)
         self.scoped.clear_editors()
         self._editors.clear()
         if file is None:
@@ -152,7 +191,7 @@ class PermissionsTab(QWidget):
         self.scoped.refresh()
 
     def _add_tool(self, name: str, rules: ToolRules) -> None:
-        editor = ScopeRulesEditor(self._on_change)
+        editor = ScopeRulesEditor(self._notify, name)
         editor.set_section(rules.default, _rules_all_effect(rules))
         editor.set_unknown(rules.unknown)
         for scope in rules.deny:
@@ -163,7 +202,7 @@ class PermissionsTab(QWidget):
         self._editors.append((name, editor, False))
 
     def _add_mcp(self, server: str, rules: McpServerRules) -> None:
-        editor = ScopeRulesEditor(self._on_change)
+        editor = ScopeRulesEditor(self._notify, server)
         editor.set_section(rules.default, _rules_all_effect(rules))
         editor.set_unknown(rules.unknown)
         for scope in rules.deny:
@@ -172,6 +211,16 @@ class PermissionsTab(QWidget):
             editor.add_row(scope, "allow")
         self.scoped.add_editor(f"[mcp.{server}]", editor)
         self._editors.append((server, editor, True))
+
+    def set_file(self, file: permissions.PermissionsFile | None) -> None:
+        """Track which file the tab edits, and whether adding is possible."""
+        self._file = file
+        self.add_tool_btn.setEnabled(file is not None)
+        self.add_mcp_btn.setEnabled(file is not None)
+
+    def section_names(self) -> list[str]:
+        """Tool names already present in the loaded file."""
+        return [] if self._file is None else sorted(self._file.tools)
 
     def add_tool_section(self, name: str) -> str | None:
         """Add a ``[name]`` section, or return an error message."""
@@ -201,13 +250,29 @@ class PermissionsTab(QWidget):
             self._add_tool(name, self._file.tools[name])
         return None
 
-    def collect(self) -> permissions.PermissionsFile | None:
-        """Write the widget state back into the model and return it."""
+    def _notify(self) -> None:
+        """Tell the owner the rules changed, unless we are loading them."""
+        if not self._loading:
+            self._on_change()
+
+    def collect(self, *, commit: bool = True) -> permissions.PermissionsFile | None:
+        """The widget state as a model, written back into it unless previewing.
+
+        ``commit=False`` answers "what would this save" without touching the
+        loaded file, so asking whether a store is dirty cannot itself make it so.
+        """
         if self._file is None:
             return None
         previous = self._file
-        self._file.tools.clear()
-        self._file.mcp.clear()
+        target = (
+            previous
+            if commit
+            else permissions.PermissionsFile(
+                path=previous.path, default=previous.default, _unknown=dict(previous._unknown)
+            )
+        )
+        target.tools.clear()
+        target.mcp.clear()
         for name, editor, is_mcp in self._editors:
             if is_mcp:
                 old = previous.mcp.get(name)
@@ -219,7 +284,7 @@ class PermissionsTab(QWidget):
                 _assign_all_effect(mcp_rules, editor.all_effect())
                 for scope, effect in editor.rows():
                     (mcp_rules.deny if effect == "deny" else mcp_rules.allow).append(scope)
-                self._file.mcp[name] = mcp_rules
+                target.mcp[name] = mcp_rules
             else:
                 old = previous.tools.get(name)
                 tool_rules = ToolRules(
@@ -230,8 +295,35 @@ class PermissionsTab(QWidget):
                 _assign_all_effect(tool_rules, editor.all_effect())
                 for scope, effect in editor.rows():
                     (tool_rules.deny if effect == "deny" else tool_rules.allow).append(scope)
-                self._file.tools[name] = tool_rules
-        return self._file
+                target.tools[name] = tool_rules
+        return target
+
+
+def ask_tool_name(parent, title: str, present: set[str]) -> str | None:
+    """Ask for a tool name, suggesting maki's built-ins.
+
+    A name already in this file stays listed but unselectable, so one section per
+    tool is enforced visibly: hiding it would leave the user wondering where
+    ``bash`` went. The field is still editable, because a build may meet a tool
+    it has never heard of. It opens on the first name that can be picked, since
+    starting on a greyed entry makes the dialog look broken.
+    """
+    dialog = QInputDialog(parent)
+    dialog.setWindowTitle(title)
+    dialog.setLabelText(QCoreApplication.translate("window", "Tool name:"))
+    dialog.setComboBoxItems(list(BUILTIN_TOOLS))
+    dialog.setComboBoxEditable(True)
+    combo = dialog.findChild(QComboBox)
+    for index, tool in enumerate(BUILTIN_TOOLS):
+        if tool in present:
+            item = combo.model().item(index)
+            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsSelectable & ~Qt.ItemFlag.ItemIsEnabled)
+    first_free = next((i for i, tool in enumerate(BUILTIN_TOOLS) if tool not in present), None)
+    if first_free is not None:
+        combo.setCurrentIndex(first_free)
+    if dialog.exec() != QDialog.DialogCode.Accepted:
+        return None
+    return dialog.textValue().strip() or None
 
 
 class SessionsTab(QWidget):
@@ -240,6 +332,7 @@ class SessionsTab(QWidget):
         self._views: list[workspace.SessionView] = []
         self._current: workspace.Session | None = None
         self._on_change = on_change
+        self._loading = False
         self._is_dirty = is_dirty
         self._rebaselined = rebaselined
 
@@ -247,7 +340,6 @@ class SessionsTab(QWidget):
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
         self._shown = -1
-        self.loading = False
 
         left = QWidget()
         left_layout = QVBoxLayout(left)
@@ -328,7 +420,13 @@ class SessionsTab(QWidget):
 
     def _populate_row(self, row: int, *, reload: bool = True) -> None:
         self._shown = row
-        self.loading = True
+        self._loading = True
+        try:
+            self._fill_row(row, reload=reload)
+        finally:
+            self._loading = False
+
+    def _fill_row(self, row: int, *, reload: bool) -> None:
         self.scoped.clear_editors()
         self._editors.clear()
         if row < 0 or row >= len(self._views):
@@ -337,7 +435,6 @@ class SessionsTab(QWidget):
             self.file_label.setText(self.tr("file: (none)"))
             self.header.setText(self.tr("Select a session"))
             self.scoped.set_empty_hint("")
-            self.loading = False
             return
         view = self._views[row]
         # Re-read before showing: a live session grows while maki runs, so the
@@ -358,7 +455,7 @@ class SessionsTab(QWidget):
         self.file_label.setText(self.tr("file: {path}").format(path=session.path))
         self.header.setText(self._session_header(session))
         for group in sessions.ToolGroup.group(session.rules):
-            editor = ScopeRulesEditor(self._on_change)
+            editor = ScopeRulesEditor(self._notify, group.tool)
             editor.set_section(None, group.all_effect)
             for scope, effect in group.scopes:
                 editor.add_row(scope, effect)
@@ -368,7 +465,11 @@ class SessionsTab(QWidget):
         # race with maki re-appending to the same file on exit.
         self.set_read_only(view.locked)
         self.scoped.refresh()
-        self.loading = False
+
+    def _notify(self) -> None:
+        """Tell the owner the rules changed, unless we are loading them."""
+        if not self._loading:
+            self._on_change()
 
     def set_read_only(self, read_only: bool) -> None:
         """Enable or disable editing of the shown session in place."""
@@ -441,11 +542,8 @@ class SessionsTab(QWidget):
     def _add_group(self) -> None:
         if self._current is None:
             return
-        name, ok = QInputDialog.getText(
-            self, self.tr("Add tool group"), self.tr("Tool name (e.g. bash):")
-        )
-        name = name.strip()
-        if not ok or not name:
+        name = ask_tool_name(self, self.tr("Add tool group"), {tool for tool, _ in self._editors})
+        if name is None:
             return
         if not TOOL_NAME_RE.match(name):
             QMessageBox.warning(
@@ -464,7 +562,7 @@ class SessionsTab(QWidget):
                 self.tr("A group named '{name}' already exists.").format(name=name),
             )
             return
-        editor = ScopeRulesEditor(self._on_change)
+        editor = ScopeRulesEditor(self._notify, name)
         editor.add_row("", EFFECT_ALLOW)
         self.scoped.add_editor(name, editor)
         self._editors.append((name, editor))
@@ -764,8 +862,6 @@ class MainWindow(QMainWindow):
         self._maki_cache_prev: bool | None = None
         self._force_close = False
         self.workspace = workspace.load_workspace()
-        self.add_tool_btn = None
-        self.add_mcp_btn = None
 
         central = QWidget()
         layout = QVBoxLayout(central)
@@ -784,12 +880,20 @@ class MainWindow(QMainWindow):
             self.tr("No global permissions file yet."), self._mark_dirty
         )
         self.projects_tab = PermissionsTab(self.tr("Select a project."), self._mark_dirty)
+        for tab, add_tool, add_mcp in (
+            (self.global_tab, self._add_global_tool, self._add_global_mcp),
+            (self.projects_tab, self._add_project_tool, self._add_project_mcp),
+        ):
+            tab.add_tool_btn.clicked.connect(add_tool)
+            tab.add_mcp_btn.clicked.connect(add_mcp)
         self.folders_tab = FoldersTab(self._mark_dirty)
 
         # The projects tab pairs a selector with the permissions editor.
         self.projects_selector = QListWidget()
         self.projects_selector.setMaximumWidth(320)
         self.projects_selector.currentRowChanged.connect(self._project_selected)
+        # The add buttons sit with the editor they act on, like the Sessions
+        # tab's own + Add tool group, so the footer is only ever Save/reload.
         projects_container = QWidget()
         pc_layout = QHBoxLayout(projects_container)
         pc_layout.addWidget(self.projects_selector)
@@ -809,14 +913,8 @@ class MainWindow(QMainWindow):
         reload_all.clicked.connect(self._reload)
         self.reload_file_btn = QPushButton(self.tr("Reload file"))
         self.reload_file_btn.clicked.connect(self._reload_current)
-        self.add_tool_btn = QPushButton(self.tr("+ Tool section (project)"))
-        self.add_tool_btn.clicked.connect(self._add_project_tool)
-        self.add_mcp_btn = QPushButton(self.tr("+ MCP server (project)"))
-        self.add_mcp_btn.clicked.connect(self._add_project_mcp)
         bar.addWidget(reload_all)
         bar.addWidget(self.reload_file_btn)
-        bar.addWidget(self.add_tool_btn)
-        bar.addWidget(self.add_mcp_btn)
         bar.addStretch(1)
         bar.addWidget(save)
         layout.addLayout(bar)
@@ -838,7 +936,9 @@ class MainWindow(QMainWindow):
 
     def _setup_shortcuts(self) -> None:
         QShortcut(QKeySequence("Ctrl+S"), self, activated=self._save)
-        QShortcut(QKeySequence("Ctrl+R"), self, activated=self._reload)
+        # The shortcut re-reads the current file only: discarding every store's
+        # edits is the riskier action and stays a deliberate button click.
+        QShortcut(QKeySequence("Ctrl+R"), self, activated=self._reload_current)
 
     def _show_theme_menu(self, pos) -> None:
         """Right-click menu: pick dark, light, or follow the system.
@@ -855,7 +955,7 @@ class MainWindow(QMainWindow):
         import qdarktheme
         from qtpy.QtWidgets import QActionGroup, QMenu
 
-        from .app import apply_theme, load_theme_mode, resolved_theme
+        from .app import apply_theme, is_debug_logging, load_theme_mode, resolved_theme
 
         # `auto` is the one label that is not static: it carries the theme the
         # system currently resolves to, so a detection that reports light is
@@ -878,9 +978,21 @@ class MainWindow(QMainWindow):
             group.addAction(action)
             actions[action] = mode
 
+        menu.addSeparator()
+        debug_action = menu.addAction(self.tr("Debug logging"))
+        debug_action.setCheckable(True)
+        debug_action.setChecked(is_debug_logging())
+
         picked = menu.exec(self.mapToGlobal(pos))
         if picked in actions:
             apply_theme(actions[picked])
+        elif picked is debug_action:
+            from .app import set_debug_logging
+
+            set_debug_logging(debug_action.isChecked())
+            self._update_status(
+                self.tr("Debug logging on." if debug_action.isChecked() else "Debug logging off.")
+            )
 
     def changeEvent(self, event) -> None:
         if event.type() == event.Type.ActivationChange and self.isActiveWindow():
@@ -1010,24 +1122,14 @@ class MainWindow(QMainWindow):
         fires the same callbacks, and announcing "unsaved changes" there was a
         claim nothing had made true.
         """
-        if self._loading or self.sessions_tab.loading:
+        if self._loading:
             return
         self._commit_current()
         self._refresh_marks()
         dirty = sorted(self._session_targets())
-        LOGGER.info("change: dirty rows=%s", dirty)
+        LOGGER.debug("change: dirty rows=%s", dirty)
         self._update_status(
             self.tr("Unsaved changes.") if self._dirty() else self.tr("No unsaved changes.")
-        )
-
-    def _log_dirty(self, event: str) -> None:
-        """Record which rows count as dirty after an event that can move a
-        baseline, so a phantom mark can be traced to the step that caused it."""
-        LOGGER.info(
-            "%s: dirty rows=%s locked=%s",
-            event,
-            sorted(self._session_targets()),
-            [v.session.session_id for v in self.workspace.sessions if v.locked],
         )
 
     def _dirty(self) -> bool:
@@ -1093,12 +1195,35 @@ class MainWindow(QMainWindow):
         """
         return sorted({target.path.name for _, target in self._changed_stores()})
 
-    def _global_dirty(self) -> bool:
-        """Whether the global permissions file differs from its baseline."""
-        file = self.workspace.global_permissions
-        if file is None or file.path not in self._baseline:
+    def _pending_names_in(self, tab: int) -> list[str]:
+        """Pending file names belonging to one tab, so a per-file reload does not
+        warn about edits in a different store.
+
+        ``_changed_stores`` commits the visible editor as a side effect, which is
+        right for Save but wrong when deciding whether to ask: use
+        ``_editor_dirty`` for the file the reload is about.
+        """
+        return sorted(
+            {target.path.name for tab_index, target in self._changed_stores() if tab_index == tab}
+        )
+
+    def _editor_dirty(self, path) -> bool:
+        """Whether the editor currently showing ``path`` differs from its baseline.
+
+        ``_changed_stores`` collects the visible widget state into the model, so
+        using it to decide whether anyone may reload would make the file dirty by
+        the act of asking. This compares what the widgets hold now against the
+        baseline and leaves both untouched.
+        """
+        if path not in self._baseline:
             return False
-        return file.to_toml() != self._baseline[file.path]
+        if path == paths.global_permissions_path():
+            current = self.global_tab.collect(commit=False)
+        elif self._shown_project_row >= 0:
+            current = self.projects_tab.collect(commit=False)
+        else:
+            return False
+        return current is not None and current.to_toml() != self._baseline[path]
 
     def _dirty_names(self, target: safe_write.WriteTarget | None) -> list[str]:
         """The name of ``target`` if it is pending, else empty: asks nothing.
@@ -1192,14 +1317,7 @@ class MainWindow(QMainWindow):
             return
         self._baseline[view.permissions_file.path] = view.permissions_file.to_toml()
         if row == self._shown_project_row:
-            # load() fires the change callback, which commits the tab back into
-            # the model. Doing it inside the loading guard keeps that commit off
-            # the freshly read file, or it would restore the discarded edit.
-            self._loading = True
-            try:
-                self.projects_tab.load(view.permissions_file)
-            finally:
-                self._loading = False
+            self.projects_tab.load(view.permissions_file)
         self._refresh_marks()
         self._update_status(self.tr("Reloaded {name}.").format(name=view.label))
 
@@ -1208,9 +1326,7 @@ class MainWindow(QMainWindow):
         if file is None:
             return
         name = file.path.name
-        pending = self._dirty_names(
-            safe_write.WriteTarget(path=file.path) if self._global_dirty() else None
-        )
+        pending = [name] if self._editor_dirty(file.path) else []
         if not self._confirm_discard(self.tr("Reloading the global file"), pending):
             return
         try:
@@ -1226,7 +1342,8 @@ class MainWindow(QMainWindow):
 
     def _reload_folders(self) -> None:
         """Re-read the folder-trust document and the pre-trust roots together."""
-        if not self._confirm_discard(self.tr("Reloading the folder trust files")):
+        pending = self._pending_names_in(FOLDERS_TAB)
+        if not self._confirm_discard(self.tr("Reloading the folder trust files"), pending):
             return
         try:
             self.workspace.trust_document = folders.TrustDocument.load(paths.trusted_folders_path())
@@ -1257,7 +1374,10 @@ class MainWindow(QMainWindow):
         if index != GLOBAL_TAB or self.workspace.global_permissions is None:
             return
         path = self.workspace.global_permissions.path
-        if self._global_dirty():
+        if (
+            path in self._baseline
+            and self.workspace.global_permissions.to_toml() != self._baseline[path]
+        ):
             return
         try:
             self.workspace.global_permissions = permissions.PermissionsFile.load(path)
@@ -1275,8 +1395,6 @@ class MainWindow(QMainWindow):
             self._refresh_marks()
         if row < 0 or row >= len(self.workspace.projects):
             self.projects_tab.load(None)
-            self.add_tool_btn.setEnabled(False)
-            self.add_mcp_btn.setEnabled(False)
             return
         view = self.workspace.projects[row]
         # Re-read a project file so a change maki made mid-run shows — but only
@@ -1285,25 +1403,38 @@ class MainWindow(QMainWindow):
         reloaded = row not in self._project_targets() and view.reload()
         if reloaded:
             self._baseline[view.permissions_file.path] = view.permissions_file.to_toml()
-        # load() fires the change callback, which commits the tab into the model.
-        # Inside the loading guard that commit cannot rewrite the file just read
-        # from disk, which would re-dirty a project nobody edited.
-        self._loading = True
-        try:
-            self.projects_tab.load(view.permissions_file)
-        finally:
-            self._loading = False
+        self.projects_tab.load(view.permissions_file)
         self._shown_project_row = row
-        self.add_tool_btn.setEnabled(True)
-        self.add_mcp_btn.setEnabled(True)
 
     def _add_project_tool(self) -> None:
+        name = ask_tool_name(
+            self,
+            self.tr("Add tool section"),
+            set(self.projects_tab.section_names()),
+        )
+        if name is None:
+            return
+        error = self.projects_tab.add_tool_section(name)
+        if error:
+            QMessageBox.warning(self, self.tr("Cannot add section"), error)
+
+    def _add_global_tool(self) -> None:
+        name = ask_tool_name(
+            self, self.tr("Add tool section"), set(self.global_tab.section_names())
+        )
+        if name is None:
+            return
+        error = self.global_tab.add_tool_section(name)
+        if error:
+            QMessageBox.warning(self, self.tr("Cannot add section"), error)
+
+    def _add_global_mcp(self) -> None:
         name, ok = QInputDialog.getText(
-            self, self.tr("Add tool section"), self.tr("Tool name (e.g. write):")
+            self, self.tr("Add MCP server"), self.tr("Server name (e.g. github):")
         )
         if not ok or not name.strip():
             return
-        error = self.projects_tab.add_tool_section(name.strip())
+        error = self.global_tab.add_mcp_section(name.strip())
         if error:
             QMessageBox.warning(self, self.tr("Cannot add section"), error)
 
@@ -1560,7 +1691,7 @@ class MainWindow(QMainWindow):
         unlock would compare maki's own rewrite against the old baseline and mark
         a session the user never touched as dirty.
         """
-        LOGGER.info("lock change: rows=%s", sorted(rows))
+        LOGGER.debug("lock change: rows=%s", sorted(rows))
         sessions_dir = paths.sessions_dir()
         shown = self.sessions_tab._shown
         parked: set[int] = set()
@@ -1576,7 +1707,7 @@ class MainWindow(QMainWindow):
                 if row != shown:
                     view.reload()
                 rebaselined.add(row)
-            LOGGER.info(
+            LOGGER.debug(
                 "lock change: row=%d id=%s locked=%s pending=%s",
                 row,
                 view.session.session_id,
@@ -1593,7 +1724,7 @@ class MainWindow(QMainWindow):
             self.sessions_tab.set_read_only(True)
         for row in rebaselined:
             self._rebaseline_session(self.workspace.sessions[row])
-        self._log_dirty("lock change")
+        LOGGER.debug("lock change done: dirty rows=%s", sorted(self._session_targets()))
 
     def _rebaseline_session(self, view: workspace.SessionView, *, sync: bool = True) -> None:
         """Adopt a reloaded session's rules as its baseline.
@@ -1725,10 +1856,10 @@ class MainWindow(QMainWindow):
             self._update_status(self.tr("Nothing to save in this view."))
             return
 
-        LOGGER.info("save: %d target(s)", len(targets))
+        LOGGER.debug("save: %d target(s)", len(targets))
         targets = self._drop_locked_sessions(targets)
         if not targets:
-            LOGGER.info("save: nothing left, target open in maki")
+            LOGGER.debug("save: nothing left, target open in maki")
             self._update_status(self.tr("Nothing saved: file is open in maki."))
             return
 
@@ -1737,7 +1868,7 @@ class MainWindow(QMainWindow):
             self._update_status(self.tr("Nothing to save: this view matches the file on disk."))
             return
         if review is not None and not self._confirm_save(review):
-            LOGGER.info("save cancelled at review: %s", review.path)
+            LOGGER.debug("save cancelled at review: %s", review.path)
             self._update_status(self.tr("Save cancelled; your changes are still pending."))
             return
 

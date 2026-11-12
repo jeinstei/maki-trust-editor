@@ -69,7 +69,11 @@ There are four tabs along the top and a **Save** button at the bottom:
 
 **Save** writes the file for the tab you are on (see *Saving* below).
 
-**Keyboard:** Ctrl+S saves, Ctrl+R reloads everything from disk.
+**Reloading:** **Reload file** re-reads just the file on the current tab, and
+**Reload all** re-reads everything. Both ask before throwing away unsaved changes
+and name the files at risk.
+
+**Keyboard:** Ctrl+S saves, Ctrl+R re-reads the file on the current tab.
 
 ## Editing rules
 
@@ -90,6 +94,13 @@ with a letter, digit or underscore — duplicates are rejected.
 When a project or global file is empty (or does not exist yet) the rules area
 shows a hint pointing at those add buttons, so you can start straight away — you
 do not need to save an empty file first.
+
+**Repeated rules.** A rule is identified by its tool and its scope. If two rows
+in one section end up with the same tool and scope, the row is annotated:
+*duplicate rule for this scope* when they agree, or *conflicting effects: allow,
+deny* when they do not (in which case which one wins depends on maki's own
+evaluation order). These are notes, not errors — nothing is blocked, and a file
+that already contains one shows it as soon as it is loaded.
 
 **Finding things:** to the right of a section heading is a **Section** picker
 that narrows the view to one tool, and a collapsible **Filter** box (the
@@ -115,6 +126,27 @@ Nothing but a changed file is written: on Save, maki-trust-editor compares each
 file against what it loaded and writes only the ones you actually changed, so
 untouched files are never rewritten or backed up.
 
+### Reviewing a save
+
+When you save a project, global or folder-trust file, the app shows you the
+changes before writing them:
+
+```
++ bash  make *  deny                    ← added
+- read  /etc/**  allow                  ← removed
+~ bash  git *  deny  (was allow)        ← effect changed
+```
+
+Pick **Write** to save, or **Cancel** to back out — cancelling writes nothing and
+your edits stay exactly as they were. This catches a change you made in a section
+that scrolled out of view, which is easy to miss in a long rule set.
+
+The list is built from the file as it is on disk right now, so if maki changed the
+file while you were editing, what you see is what will happen.
+
+Session files skip this step: they are not shared, and the open-session check
+already covers them.
+
 ## Staying safe
 
 Editing maki's files while maki is running can go wrong in two ways: maki may
@@ -126,13 +158,14 @@ against both:
 - **Atomic writes.** Changes go to a temporary file and are renamed into place,
   so a crash never leaves a half-written file. A symlinked target is followed to
   the real file, so a dotfile-managed link is never replaced by a regular file.
-- **A "maki is running" guard.** The app looks for a running `maki` process and
-  refuses to silently overwrite:
+- **A "maki is running" guard.** The app looks for a running `maki` process
+  before writing:
   - **Shared** files (project/global `permissions.toml` and the folder-trust
-    file) can be written by any maki process, so a running maki blocks them.
-    On Linux the app also checks whether maki actually holds that file open.
-  - **Session** files are only appended by the process that has them open, so a
-    running maki only warns; you can still choose to write.
+    file) can be written by any maki process, so while maki holds that file open
+    the save is **refused** — close maki and try again. Nothing is written.
+  - **Session** files are only appended by the process that has one open, and
+    the app checks that lock directly, so a session you can edit is saved
+    normally even while maki is running.
 
 The cleanest approach is still to close all maki sessions before editing.
 
@@ -192,7 +225,8 @@ system locale is used.
 
 Right-click anywhere in the window to pick **Dark** (the default), **Light**, or
 **Follow system**. The choice is remembered across runs, and switching applies
-immediately.
+immediately. The same menu has a **Debug logging** switch (see *Log and
+troubleshooting*).
 
 **Follow system** relies on [darkdetect](https://github.com/albertosottile/darkdetect),
 which on Linux reads only the GTK theme, so it follows your GTK/desktop theme
@@ -234,6 +268,12 @@ It records the session locks at startup, every save and its result, and any file
 that failed to load, including uncaught crashes — useful because a windowed app
 has no console.
 
+If you need more detail for a bug report, turn on **Debug logging**: right-click
+anywhere in the window and tick it (or start the app with
+`MAKI_TRUST_EDITOR_DEBUG=1`). It adds a line for each change of state — which
+rules are pending, every reload, each open-session flip — and takes effect
+immediately.
+
 ## Project layout (for developers)
 
 ```
@@ -246,6 +286,7 @@ src/maki_trust_editor/
   folders.py       read/rewrite trusted-folders.json and pre-trust-roots.json
   workspace.py     gather everything into view models
   safe_write.py    backup + atomic write + maki-closed guard
+  changes.py       what a save will change, diffed against the file on disk
   widgets.py       checkbox scope editor widgets
   window.py        the main window, tabs, and folder trust dialog
   app.py           entry point, logging, Ctrl-C handling

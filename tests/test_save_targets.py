@@ -161,7 +161,8 @@ def _drive_add_group(window: MainWindow, name: str, monkeypatch) -> list[str]:
     from qtpy.QtWidgets import QInputDialog, QMessageBox
 
     warnings: list[str] = []
-    monkeypatch.setattr(QInputDialog, "getText", lambda *a, **k: (name, True))
+    monkeypatch.setattr(QInputDialog, "exec", lambda self: 1)
+    monkeypatch.setattr(QInputDialog, "textValue", lambda self: name)
     monkeypatch.setattr(
         QMessageBox, "warning", lambda *a, **k: warnings.append(a[2] if len(a) > 2 else "")
     )
@@ -299,33 +300,28 @@ def test_unlocked_session_saves_while_maki_runs(window: MainWindow, monkeypatch)
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="open-fd detection is /proc-only")
-def test_blocked_targets_skips_shared_but_not_session(tmp_path: Path) -> None:
-    shared_path = tmp_path / "permissions.toml"
-    shared_path.write_text("x", encoding="utf-8")
-    handle = open(shared_path, "rb")
-    try:
-        shared = safe_write.WriteTarget(path=shared_path, content="x")
-        session = safe_write.WriteTarget(path=tmp_path / "a.jsonl", shared=False)
-        status = safe_write.MakiStatus(running=True, pids=[os.getpid()])
+@pytest.mark.parametrize(
+    ("maki_running", "shared", "in_use", "blocked"),
+    [
+        (True, True, True, True),
+        (True, False, True, False),
+        (True, True, False, False),
+        (False, True, True, False),
+    ],
+    ids=["shared-in-use", "session-target", "shared-not-in-use", "maki-not-running"],
+)
+def test_blocked_targets_only_blocks_a_shared_file_in_use(
+    tmp_path: Path, monkeypatch, maki_running, shared, in_use, blocked
+) -> None:
+    """Only a shared file maki actually holds open is refused.
 
-        blocked = safe_write.blocked_targets([shared, session], status)
+    Which files are "in use" is a /proc question answered by ``file_in_use``, so
+    that is stubbed: this pins the decision built on it, not the inspection. A
+    session target is never blocked (the lock check covers it), and with maki
+    not running nothing is.
+    """
+    monkeypatch.setattr(safe_write, "file_in_use", lambda path, pids: in_use)
+    target = safe_write.WriteTarget(path=tmp_path / "permissions.toml", content="x", shared=shared)
+    status = safe_write.MakiStatus(running=maki_running, pids=[os.getpid()] if maki_running else [])
 
-        assert shared in blocked
-        assert session not in blocked
-    finally:
-        handle.close()
-
-
-@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="open-fd detection is /proc-only")
-def test_shared_target_not_caught_open_is_not_blocked(tmp_path: Path) -> None:
-    shared = safe_write.WriteTarget(path=tmp_path / "permissions.toml", content="x")
-    status = safe_write.MakiStatus(running=True, pids=[os.getpid()])
-
-    assert safe_write.blocked_targets([shared], status) == []
-
-
-def test_blocked_targets_empty_when_maki_not_running(tmp_path: Path) -> None:
-    shared = safe_write.WriteTarget(path=tmp_path / "permissions.toml", content="x")
-    status = safe_write.MakiStatus(running=False, pids=[])
-
-    assert safe_write.blocked_targets([shared], status) == []
+    assert (target in safe_write.blocked_targets([target], status)) == blocked

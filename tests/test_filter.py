@@ -23,7 +23,7 @@ def app() -> QApplication:
 
 
 def _section(label: str, rows: list[tuple[str, str]]) -> ScopeRulesEditor:
-    editor = ScopeRulesEditor(lambda: None)
+    editor = ScopeRulesEditor(lambda: None, "bash")
     for scope, effect in rows:
         editor.add_row(scope, effect)
     return editor
@@ -76,31 +76,42 @@ def test_filter_is_not_applied_until_enter(holder: ScopedHolder) -> None:
     assert _box_visible(holder) == {"[bash]": True, "[edit]": True, "[empty]": True}
 
 
-def test_wildcard_star_matches_any_run(holder: ScopedHolder) -> None:
-    _filter(holder, "git*")
+@pytest.mark.parametrize(
+    ("pattern", "section", "visible"),
+    [
+        ("git*", 0, [True, False]),
+        ("ls ?", 0, [False, True]),
+        ("py", 1, [True]),
+        ("*.py", 1, [True]),
+        ("[", 0, [False, False]),
+        ("?*.py", 1, [True]),
+    ],
+    ids=["star", "question", "substring", "wildcard-dot", "bad-pattern", "question-one-char"],
+)
+def test_filter_pattern_selects_rows(holder: ScopedHolder, pattern, section, visible) -> None:
+    """Wildcards, plain substrings and literal regex characters all narrow as documented.
 
-    assert _row_visible(holder._sections[0][2]) == [True, False]
+    A pattern with no wildcard is a substring match, ``*`` runs and ``?`` takes
+    exactly one character, and a regex metacharacter is literal: an unclosed
+    ``[`` matches nothing rather than raising.
+    """
+    _filter(holder, pattern)
+
+    assert _row_visible(holder._sections[section][2]) == visible
 
 
-def test_wildcard_question_matches_one_char(holder: ScopedHolder) -> None:
-    _filter(holder, "ls ?")
+def test_question_wildcard_takes_exactly_one_character(holder: ScopedHolder) -> None:
+    """``?`` is one character, not a run of them.
 
-    assert _row_visible(holder._sections[0][2]) == [False, True]
+    Checked on the matcher directly: through a row the difference between ``?``
+    and ``.*`` lands on the same visible result, so a row assertion would not
+    pin it.
+    """
+    from maki_trust_editor.widgets import compile_filter, matches
 
-
-def test_wildcard_substring_still_matches_without_wildcard(holder: ScopedHolder) -> None:
-    _filter(holder, "py")
-
-    assert _box_visible(holder) == {"[bash]": False, "[edit]": True, "[empty]": False}
-    assert _row_visible(holder._sections[1][2]) == [True]
-
-
-def test_filter_escapes_regex_metacharacters(holder: ScopedHolder) -> None:
-    # A '.' must be a literal dot, not "any character".
-    _filter(holder, "*.py")
-
-    assert _row_visible(holder._sections[1][2]) == [True]
-    assert _box_visible(holder)["[bash]"] is False
+    matcher = compile_filter("a?c")
+    assert matches(matcher, "abc")
+    assert not matches(matcher, "abbc")
 
 
 def test_picker_shows_only_that_section(holder: ScopedHolder) -> None:
@@ -182,24 +193,3 @@ def test_reload_resets_picker_to_all_sections(holder: ScopedHolder) -> None:
 
     assert holder.section_box.currentText() == ScopedHolder.ALL_SECTIONS
     assert _box_visible(holder) == {"[bash]": True, "[edit]": True}
-
-
-@pytest.mark.parametrize(
-    ("pattern", "expected"),
-    [
-        ("", None),
-        ("git", None),
-        ("git*", True),
-        ("g?t", True),
-        ("*", True),
-        ("no-wildcard", None),
-    ],
-)
-def test_compile_filter_wildcard_detection(pattern: str, expected) -> None:
-    from maki_trust_editor.widgets import WILDCARDS, compile_filter
-
-    compiled = compile_filter(pattern)
-    if expected is None:
-        assert compiled is None or not any(c in pattern for c in WILDCARDS)
-    else:
-        assert compiled is not None

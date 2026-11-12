@@ -77,10 +77,6 @@ def _state_root() -> Path:
     return _env_path("XDG_STATE_HOME") or (home() / ".local" / "state")
 
 
-def _platform_state_dir() -> Path:
-    return _state_root() / APP_NAME
-
-
 def config_dir() -> Path:
     """Where global config (permissions.toml, providers.toml, ...) lives."""
     legacy = legacy_dir()
@@ -94,7 +90,7 @@ def state_dir() -> Path:
     legacy = legacy_dir()
     if legacy.is_dir():
         return legacy
-    return _platform_state_dir()
+    return _state_root() / APP_NAME
 
 
 def sessions_dir() -> Path:

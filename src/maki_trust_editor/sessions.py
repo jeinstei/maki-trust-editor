@@ -175,6 +175,23 @@ def rule_set(rules: list[SessionRule]) -> Counter[tuple[str, str | None, str]]:
     return Counter((rule.tool, rule.scope, rule.effect) for rule in rules)
 
 
+def scope_conflicts(rules: list[SessionRule]) -> dict[tuple[str, str], list[str]]:
+    """Rules that share a ``(tool, scope)``, which is meant to identify one rule.
+
+    Two rules for the same tool at the same scope say nothing extra when they
+    agree, and contradict each other when they do not: which wins depends on the
+    order maki evaluates them in, which this editor does not model. Both are
+    reported rather than prevented, because a file may already hold them and
+    rewriting the user's intent is worse than showing it.
+    """
+    seen: dict[tuple[str, str], list[str]] = {}
+    for rule in rules:
+        if rule.scope is None:
+            continue
+        seen.setdefault((rule.tool, rule.scope), []).append(rule.effect)
+    return {key: effects for key, effects in seen.items() if len(effects) > 1}
+
+
 @dataclass
 class Session:
     path: Path

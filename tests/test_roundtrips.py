@@ -240,3 +240,101 @@ def test_safe_write_follows_a_symlink_without_breaking_it(tmp_path: Path) -> Non
     assert link.read_text() == "new\n"
     assert result.backups == [tmp_path / "real.toml.bak"]
     assert result.backups[0].read_text() == "old\n"
+
+
+@pytest.mark.parametrize(
+    ("rules", "expected"),
+    [
+        ([], {}),
+        ([("bash", "git *", "allow")], {}),
+        ([("bash", "git *", "allow"), ("bash", "make *", "deny")], {}),
+        (
+            [("bash", "git *", "allow"), ("bash", "git *", "allow")],
+            {("bash", "git *"): ["allow", "allow"]},
+        ),
+        (
+            [("bash", "git *", "allow"), ("bash", "git *", "deny")],
+            {("bash", "git *"): ["allow", "deny"]},
+        ),
+        (
+            [("bash", "git *", "allow"), ("read", "git *", "deny")],
+            {},
+        ),
+    ],
+)
+def test_scope_conflicts_reports_only_repeated_scopes(rules, expected) -> None:
+    """A repeated (tool, scope) is reported; a different tool is a different rule."""
+    built = [sessions.SessionRule(tool, scope, effect) for tool, scope, effect in rules]
+    assert sessions.scope_conflicts(built) == expected
+
+
+def test_session_write_shortens_the_last_line_without_leaving_a_tail(
+    tmp_path: Path,
+) -> None:
+    """A shorter rules line must truncate the old one.
+
+    The prefix is copied and the last line rewritten in place, so writing fewer
+    bytes without truncating first would leave the tail of the old line behind
+    and produce a file that is not valid JSON.
+    """
+    path = tmp_path / "s.jsonl"
+    header = {"t": "header", "id": "abc", "cwd": "/p", "model": "m"}
+    meta = {
+        "t": "meta",
+        "title": "t",
+        "session_rules": [
+            {"tool": "bash", "scope": "a rather long scope", "effect": "allow"},
+            {"tool": "read", "scope": "/some/deep/path/**", "effect": "deny"},
+        ],
+    }
+    path.write_text("\n".join(json.dumps(x) for x in (header, meta)) + "\n", encoding="utf-8")
+
+    session = sessions.Session.load(path)
+    session.rules = [sessions.SessionRule(tool="ls")]
+    session.write()
+
+    last = path.read_text(encoding="utf-8").rstrip("\n").split("\n")[-1]
+    assert json.loads(last)["session_rules"] == [{"tool": "ls", "effect": "allow"}]
+    assert path.read_text(encoding="utf-8").count("\n") == 2
+
+
+def test_atomic_write_text_never_leaves_a_partial_file(tmp_path: Path, monkeypatch) -> None:
+    """The swap is atomic: a failure before it leaves the original intact.
+
+    Writing the temp file in place (rather than alongside, then replacing) would
+    truncate the real file first, so a crash mid-write loses the old content.
+    """
+    path = tmp_path / "permissions.toml"
+    path.write_text('default = "allow"\n', encoding="utf-8")
+    original = path.read_bytes()
+
+    import os as _os
+
+    def _boom(*_args, **_kwargs):
+        raise OSError("swap failed")
+
+    monkeypatch.setattr(_os, "replace", _boom)
+    with pytest.raises(OSError):
+        safe_write.atomic_write_text(path, 'default = "deny"\n')
+
+    assert path.read_bytes() == original
+
+
+def test_document_level_unknown_key_survives_folder_trust_round_trip(tmp_path: Path) -> None:
+    """A doc-level key a newer maki wrote must survive a save.
+
+    Per-entry unknown keys have their own test; this is the document-level dict,
+    which is a separate branch of to_json.
+    """
+    path = tmp_path / "trusted-folders.json"
+    path.write_text(
+        json.dumps({"version": 2, "future_flag": {"nested": True}, "folders": [], "rejected": []}),
+        encoding="utf-8",
+    )
+    doc = folders.TrustDocument.load(path)
+    doc.add_or_update_folder("/a", ["permissions"])
+
+    saved = json.loads(doc.to_json())
+
+    assert saved["future_flag"] == {"nested": True}
+    assert saved["folders"] == [{"path": "/a", "files": ["permissions"]}]

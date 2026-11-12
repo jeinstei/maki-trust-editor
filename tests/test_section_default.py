@@ -25,7 +25,7 @@ def app() -> QApplication:
 
 
 def _editor(default: str | None) -> ScopeRulesEditor:
-    editor = ScopeRulesEditor(lambda: None)
+    editor = ScopeRulesEditor(lambda: None, "bash")
     editor.set_section(default, None)
     return editor
 

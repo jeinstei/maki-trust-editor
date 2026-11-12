@@ -27,6 +27,7 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
+from . import sessions
 from .permissions import EFFECT_ALLOW, EFFECT_DENY, EFFECTS
 
 WILDCARDS = "*?"
@@ -96,9 +97,14 @@ class ScopeRow(QWidget):
         self._remove.setFixedWidth(80)
         self._remove.clicked.connect(lambda: on_remove(self))
 
+        self._note = QLabel("")
+        self._note.setForegroundRole(QPalette.ColorRole.PlaceholderText)
+        self._note.setVisible(False)
+
         layout.addWidget(self.scope_edit)
         layout.addWidget(self.allow_box)
         layout.addWidget(self.deny_box)
+        layout.addWidget(self._note)
         layout.addWidget(self._remove)
 
     def set_read_only(self, read_only: bool) -> None:
@@ -107,6 +113,16 @@ class ScopeRow(QWidget):
         self.allow_box.setEnabled(enabled)
         self.deny_box.setEnabled(enabled)
         self._remove.setEnabled(enabled)
+
+    def set_note(self, text: str) -> None:
+        """Show why this row is suspicious, or nothing when it is fine.
+
+        A note, not a refusal: the user may mean it, and a file may already hold
+        one. Flagging keeps the outcome visible without overriding them.
+        """
+        self._note.setText(text)
+        self._note.setVisible(bool(text))
+        self._note.setToolTip(text)
 
     def _allow_toggled(self, state: int) -> None:
         if state == Qt.CheckState.Checked.value:
@@ -138,9 +154,12 @@ class ScopeRulesEditor(QWidget):
     section default; individual scopes only ever allow or deny.
     """
 
-    def __init__(self, on_change) -> None:
+    def __init__(self, on_change, tool: str) -> None:
         super().__init__()
         self._on_change = on_change
+        # The section this editor edits. Identity is (tool, scope), so conflict
+        # detection cannot work without it.
+        self._tool = tool
         self._rows: list[ScopeRow] = []
         self._default_box_visible = True
         # A default maki would reject (e.g. "") is kept verbatim here so the row
@@ -224,12 +243,43 @@ class ScopeRulesEditor(QWidget):
     def _notify(self) -> None:
         """Tell the owner the rules changed, unless we are loading them."""
         if not self._loading:
+            self._mark_conflicts()
             self._on_change()
+
+    def _mark_conflicts(self) -> None:
+        """Flag rows that share a (tool, scope) with another row in this section.
+
+        Recomputed from the rows on every change rather than stored, so load,
+        edit and add all take the same path and nothing can go stale. A
+        contradiction is worth more than a duplicate: an identical copy says
+        nothing extra, while allow plus deny leaves the outcome to maki's
+        evaluation order, so each gets its own note.
+        """
+        groups = sessions.scope_conflicts(
+            [
+                sessions.SessionRule(tool=self._tool, scope=scope, effect=effect)
+                for scope, effect in self.rows()
+            ]
+        )
+        for row in self._rows:
+            effects = groups.get((self._tool, row.scope()))
+            if effects is None:
+                row.set_note("")
+                continue
+            distinct = sorted(set(effects))
+            row.set_note(
+                self.tr("conflicting effects: {effects}").format(effects=", ".join(distinct))
+                if len(distinct) > 1
+                else self.tr("duplicate rule for this scope")
+            )
 
     def add_row(self, scope: str, effect: str) -> None:
         row = ScopeRow(scope, effect, self._notify, self._remove_row)
         self._rows.append(row)
         self._rows_box.addWidget(row)
+        # Marked even while loading: a file that already holds a conflict must
+        # show it before the user touches anything.
+        self._mark_conflicts()
         self._notify()
 
     def set_read_only(self, read_only: bool) -> None:
@@ -402,15 +452,12 @@ class ScopedHolder(QWidget):
             self._toggle.setChecked(True)
         self._apply()
 
-    def section_names(self) -> list[str]:
-        return [label for label, _, _ in self._sections]
-
     def _rebuild_section_box(self) -> None:
         previous = self.section_box.currentText()
         self.section_box.blockSignals(True)
         self.section_box.clear()
         self.section_box.addItem(self.ALL_SECTIONS)
-        self.section_box.addItems(self.section_names())
+        self.section_box.addItems([label for label, _, _ in self._sections])
         index = self.section_box.findText(previous)
         self.section_box.setCurrentIndex(index if index >= 0 else 0)
         self.section_box.blockSignals(False)

@@ -122,7 +122,7 @@ class PermissionsFile:
         for key, value in self._unknown.items():
             doc[key] = value
         for name in sorted(self.tools):
-            doc[name] = _tool_to_table(self.tools[name])
+            doc[name] = _scoped_to_table(self.tools[name])
         if self.mcp:
             mcp_table = tomlkit.table()
             for server in sorted(self.mcp):
@@ -188,7 +188,3 @@ def _scoped_to_table(rules: Any) -> Any:
     for key, value in rules.unknown.items():
         table[key] = value
     return table
-
-
-def _tool_to_table(rules: ToolRules) -> Any:
-    return _scoped_to_table(rules)

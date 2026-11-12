@@ -30,7 +30,7 @@ def app() -> QApplication:
 
 
 def _editor() -> ScopeRulesEditor:
-    return ScopeRulesEditor(lambda: None)
+    return ScopeRulesEditor(lambda: None, "bash")
 
 
 def _shown(widget) -> bool:

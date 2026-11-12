@@ -39,6 +39,10 @@ include = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# tmp_path follows tempfile's fallback into the project root when the system
+# temp dir refuses a random-name create (some sandboxes do); conftest.py points
+# it at a subfolder instead. Old runs are not kept.
+tmp_path_retention_policy = "none"
 
 [tool.black]
 line-length = 100

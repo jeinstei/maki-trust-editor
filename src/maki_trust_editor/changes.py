@@ -44,37 +44,73 @@ class ChangeList:
         return not self.changes
 
 
-def _rule_key(rule: sessions.SessionRule) -> tuple[str, str | None, str]:
-    return (rule.tool, rule.scope, rule.effect)
-
-
 def _rule_text(tool: str, scope: str | None, effect: str) -> str:
     scope_text = scope if scope is not None else "(all scopes)"
     return f"{tool}  {scope_text}  {effect}"
 
 
 def _diff_rules(old: list[sessions.SessionRule], new: list[sessions.SessionRule]) -> list[Change]:
-    """Rules that differ, keyed by (tool, scope) so an effect flip reads as one change.
+    """Rules a write adds, removes or flips.
 
-    Effect is excluded from the key on purpose: flipping allow to deny is one
-    changed rule, not a removal plus an addition.
+    Counted as a multiset, matching how the dirty check compares rules: keying
+    on (tool, scope) alone would collapse duplicates, so adding a second
+    identical rule looked like no change at all. A key whose effect flipped and
+    whose count held is reported once, as a change, not as a swap of two rules
+    that a reader would have to pair up themselves.
     """
-    old_by_key = {(r.tool, r.scope): r.effect for r in old}
-    new_by_key = {(r.tool, r.scope): r.effect for r in new}
+    flipped = _flipped_keys(old, new)
+    old_counts = Counter((r.tool, r.scope, r.effect) for r in old)
+    new_counts = Counter((r.tool, r.scope, r.effect) for r in new)
+    old_scoped = Counter({key: n for key, n in old_counts.items() if key[:2] not in flipped})
+    new_scoped = Counter({key: n for key, n in new_counts.items() if key[:2] not in flipped})
     changes: list[Change] = []
-    for key in sorted(set(new_by_key) - set(old_by_key)):
-        changes.append(Change(ADDED, _rule_text(key[0], key[1], new_by_key[key])))
-    for key in sorted(set(old_by_key) - set(new_by_key)):
-        changes.append(Change(REMOVED, _rule_text(key[0], key[1], old_by_key[key])))
-    for key in sorted(set(old_by_key) & set(new_by_key)):
-        if old_by_key[key] != new_by_key[key]:
-            changes.append(
-                Change(
-                    CHANGED,
-                    f"{_rule_text(key[0], key[1], new_by_key[key])}" f"  (was {old_by_key[key]})",
-                )
-            )
-    return changes
+    for key in sorted(set(new_scoped) - set(old_scoped)):
+        changes.extend(Change(ADDED, _rule_text(*key)) for _ in range(new_scoped[key]))
+    for key in sorted(set(old_scoped) - set(new_scoped)):
+        changes.extend(Change(REMOVED, _rule_text(*key)) for _ in range(old_scoped[key]))
+    for key in sorted(set(old_scoped) & set(new_scoped)):
+        delta = new_scoped[key] - old_scoped[key]
+        if delta:
+            marker = ADDED if delta > 0 else REMOVED
+            changes.extend(Change(marker, _rule_text(*key)) for _ in range(abs(delta)))
+    return changes + _flip_changes(old, new, flipped)
+
+
+def _effect_at(rules: list[sessions.SessionRule]) -> dict[tuple[str, str | None], str]:
+    effects: dict[tuple[str, str | None], str] = {}
+    for rule in rules:
+        effects.setdefault((rule.tool, rule.scope), rule.effect)
+    return effects
+
+
+def _flipped_keys(
+    old: list[sessions.SessionRule], new: list[sessions.SessionRule]
+) -> set[tuple[str, str | None]]:
+    """Keys present on both sides with a different effect, ignoring counts.
+
+    Both sides must hold the key, or it is an addition or a removal rather than
+    a change of verdict.
+    """
+    old_effects, new_effects = _effect_at(old), _effect_at(new)
+    return {
+        key for key in set(old_effects) & set(new_effects) if old_effects[key] != new_effects[key]
+    }
+
+
+def _flip_changes(
+    old: list[sessions.SessionRule],
+    new: list[sessions.SessionRule],
+    flipped: set[tuple[str, str | None]],
+) -> list[Change]:
+    """One ``~`` line per flipped key, naming the effect it had and takes."""
+    old_effects, new_effects = _effect_at(old), _effect_at(new)
+    return [
+        Change(
+            CHANGED,
+            f"{_rule_text(key[0], key[1], new_effects[key])}  (was {old_effects[key]})",
+        )
+        for key in sorted(flipped)
+    ]
 
 
 def _scope_pairs(allow: list[str], deny: list[str]) -> Counter[tuple[str, str]]:

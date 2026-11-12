@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import logging.handlers
+import os
 import signal
 import sys
 
@@ -34,6 +35,7 @@ LOGGER = logging.getLogger("maki_trust_editor")
 # qdarktheme applies DEFAULT_THEME, while a desktop whose scheme it cannot read
 # (KDE with a dark scheme on some setups) reports Light and the app honestly
 # renders light, so the menu shows what `auto` currently resolves to.
+DEBUG_LOG_ENV = "MAKI_TRUST_EDITOR_DEBUG"
 DEFAULT_THEME = "dark"
 THEME_SETTINGS_KEY = "ui/theme_mode"
 
@@ -98,6 +100,26 @@ def apply_theme(mode: str, *, save: bool = True) -> str:
     return mode
 
 
+def debug_logging_requested() -> bool:
+    """Whether to log at DEBUG, from the environment at start and the menu later."""
+    return bool(os.environ.get(DEBUG_LOG_ENV))
+
+
+def is_debug_logging() -> bool:
+    """Whether the root logger is currently at DEBUG."""
+    return logging.getLogger().level <= logging.DEBUG
+
+
+def set_debug_logging(enabled: bool) -> None:
+    """Turn debug tracing on or off for this run.
+
+    Toggling the root level is enough: the handler already sits on the root
+    logger, so the per-change lines start landing in the log at once.
+    """
+    logging.getLogger().setLevel(logging.DEBUG if enabled else logging.INFO)
+    LOGGER.info("debug logging %s", "on" if enabled else "off")
+
+
 def setup_logging() -> None:
     """Log to a rotating file in our own state dir, and nothing else.
 
@@ -106,7 +128,9 @@ def setup_logging() -> None:
     runs, just without a log.
     """
     root = logging.getLogger()
-    root.setLevel(logging.INFO)
+    # Debug tracing is available on request: without this, the per-change lines
+    # would be unreachable at the INFO level the log runs at.
+    root.setLevel(logging.DEBUG if debug_logging_requested() else logging.INFO)
     try:
         paths.app_state_dir().mkdir(parents=True, exist_ok=True)
         handler = logging.handlers.RotatingFileHandler(
