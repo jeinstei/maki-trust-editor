@@ -1,7 +1,7 @@
 # maki trust editor
 
-NOTE as of 9.11.2026: This app was created with directed AI coding and actual
-user testing. The code has not yet been reviewed by a human overall.
+NOTE as of 16.11.2026: This app has been UX reviewed by a human, but the code hasn't
+yet been reviewed. But several bugs have been ironed out and it is helpful.
 
 A small desktop app for **reviewing and changing the permissions maki keeps** —
 the rules for individual chat sessions, per-project rules, your global rules, and
